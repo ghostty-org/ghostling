@@ -135,6 +135,16 @@ the Ghostty project will maintain official bindings for languages other than C
 and Zig, but I hope the community will create and maintain bindings for many
 languages!
 
+### Does libghostty require Raylib?
+
+**No no no!** libghostty has no opinion about the renderer or GUI framework
+used; it's even standalone WASM-compatible for browsers and other environments.
+
+libghostty provides a [high-performance render state API](https://libghostty.tip.ghostty.org/group__render.html)
+which only keeps track of the _state_ required to build a renderer. This is the
+same API used by Ghostty GUI for Metal and OpenGL rendering and in this repository
+for the Raylib 2D graphics API. You can layer any renderer on top of this!
+
 ### Why CMake, Raylib, etc.?
 
 I needed to pick _something_. Really, any build system and any library
