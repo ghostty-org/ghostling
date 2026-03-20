@@ -86,86 +86,230 @@ static void pty_read(int pty_fd, GhosttyTerminal terminal)
 // Input handling
 // ---------------------------------------------------------------------------
 
-// Encode a single Unicode codepoint into UTF-8 and write it to the pty.
-// This is used for printable characters that raylib delivers as codepoints
-// via GetCharPressed().
-static void pty_write_codepoint(int pty_fd, int cp)
+// Map a raylib key constant to a GhosttyKey code.
+// Returns GHOSTTY_KEY_UNIDENTIFIED for keys we don't handle.
+static GhosttyKey raylib_key_to_ghostty(int rl_key)
 {
-    char utf8[4];
-    int len;
+    // Letters — raylib KEY_A..KEY_Z are contiguous, and so are
+    // GHOSTTY_KEY_A..GHOSTTY_KEY_Z.
+    if (rl_key >= KEY_A && rl_key <= KEY_Z)
+        return GHOSTTY_KEY_A + (rl_key - KEY_A);
 
-    // Standard UTF-8 encoding: 1–4 bytes depending on codepoint range.
-    if (cp < 0x80) {
-        utf8[0] = (char)cp;
-        len = 1;
-    } else if (cp < 0x800) {
-        utf8[0] = (char)(0xC0 | (cp >> 6));
-        utf8[1] = (char)(0x80 | (cp & 0x3F));
-        len = 2;
-    } else if (cp < 0x10000) {
-        utf8[0] = (char)(0xE0 | (cp >> 12));
-        utf8[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
-        utf8[2] = (char)(0x80 | (cp & 0x3F));
-        len = 3;
-    } else {
-        utf8[0] = (char)(0xF0 | (cp >> 18));
-        utf8[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
-        utf8[2] = (char)(0x80 | ((cp >> 6) & 0x3F));
-        utf8[3] = (char)(0x80 | (cp & 0x3F));
-        len = 4;
+    // Digits — raylib KEY_ZERO..KEY_NINE are contiguous.
+    if (rl_key >= KEY_ZERO && rl_key <= KEY_NINE)
+        return GHOSTTY_KEY_DIGIT_0 + (rl_key - KEY_ZERO);
+
+    // Function keys — raylib KEY_F1..KEY_F12 are contiguous.
+    if (rl_key >= KEY_F1 && rl_key <= KEY_F12)
+        return GHOSTTY_KEY_F1 + (rl_key - KEY_F1);
+
+    switch (rl_key) {
+    case KEY_SPACE:       return GHOSTTY_KEY_SPACE;
+    case KEY_ENTER:       return GHOSTTY_KEY_ENTER;
+    case KEY_TAB:         return GHOSTTY_KEY_TAB;
+    case KEY_BACKSPACE:   return GHOSTTY_KEY_BACKSPACE;
+    case KEY_DELETE:      return GHOSTTY_KEY_DELETE;
+    case KEY_ESCAPE:      return GHOSTTY_KEY_ESCAPE;
+    case KEY_UP:          return GHOSTTY_KEY_ARROW_UP;
+    case KEY_DOWN:        return GHOSTTY_KEY_ARROW_DOWN;
+    case KEY_LEFT:        return GHOSTTY_KEY_ARROW_LEFT;
+    case KEY_RIGHT:       return GHOSTTY_KEY_ARROW_RIGHT;
+    case KEY_HOME:        return GHOSTTY_KEY_HOME;
+    case KEY_END:         return GHOSTTY_KEY_END;
+    case KEY_PAGE_UP:     return GHOSTTY_KEY_PAGE_UP;
+    case KEY_PAGE_DOWN:   return GHOSTTY_KEY_PAGE_DOWN;
+    case KEY_INSERT:      return GHOSTTY_KEY_INSERT;
+    case KEY_MINUS:       return GHOSTTY_KEY_MINUS;
+    case KEY_EQUAL:       return GHOSTTY_KEY_EQUAL;
+    case KEY_LEFT_BRACKET:  return GHOSTTY_KEY_BRACKET_LEFT;
+    case KEY_RIGHT_BRACKET: return GHOSTTY_KEY_BRACKET_RIGHT;
+    case KEY_BACKSLASH:   return GHOSTTY_KEY_BACKSLASH;
+    case KEY_SEMICOLON:   return GHOSTTY_KEY_SEMICOLON;
+    case KEY_APOSTROPHE:  return GHOSTTY_KEY_QUOTE;
+    case KEY_COMMA:       return GHOSTTY_KEY_COMMA;
+    case KEY_PERIOD:      return GHOSTTY_KEY_PERIOD;
+    case KEY_SLASH:       return GHOSTTY_KEY_SLASH;
+    case KEY_GRAVE:       return GHOSTTY_KEY_BACKQUOTE;
+    default:              return GHOSTTY_KEY_UNIDENTIFIED;
     }
-    write(pty_fd, utf8, len);
 }
 
-// Poll raylib for keyboard events and write the corresponding byte
-// sequences to the pty.
-//
-// Three categories of input:
-//   1. Printable characters — delivered by GetCharPressed() as Unicode
-//      codepoints; we UTF-8 encode them and send them straight through.
-//   2. Special / function keys — mapped to the VT escape sequences that
-//      programs on the other side of the pty expect (e.g. arrow keys
-//      send ESC [ A/B/C/D).
-//   3. Ctrl+letter combos — produce the traditional control characters
-//      (ctrl+a = 0x01, ctrl+c = 0x03, ctrl+d = 0x04, etc.).
-static void handle_input(int pty_fd)
+// Build a GhosttyMods bitmask from the current raylib modifier key state.
+static GhosttyMods get_ghostty_mods(void)
 {
-    // --- 1. Printable characters ---
-    int ch;
-    while ((ch = GetCharPressed()) != 0)
-        pty_write_codepoint(pty_fd, ch);
+    GhosttyMods mods = 0;
+    if (IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT))
+        mods |= GHOSTTY_MODS_SHIFT;
+    if (IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL))
+        mods |= GHOSTTY_MODS_CTRL;
+    if (IsKeyDown(KEY_LEFT_ALT) || IsKeyDown(KEY_RIGHT_ALT))
+        mods |= GHOSTTY_MODS_ALT;
+    if (IsKeyDown(KEY_LEFT_SUPER) || IsKeyDown(KEY_RIGHT_SUPER))
+        mods |= GHOSTTY_MODS_SUPER;
+    return mods;
+}
 
-    // --- 2. Special keys → VT escape sequences ---
-    // Each entry maps a raylib key constant to the byte sequence a
-    // traditional terminal would emit for that key.
-    static const struct { int rl_key; const char *seq; } key_map[] = {
-        { KEY_ENTER,     "\r" },       // carriage return
-        { KEY_BACKSPACE, "\177" },     // DEL (ASCII 127)
-        { KEY_TAB,       "\t" },       // horizontal tab
-        { KEY_ESCAPE,    "\033" },     // ESC
-        { KEY_UP,        "\033[A" },   // cursor up
-        { KEY_DOWN,      "\033[B" },   // cursor down
-        { KEY_RIGHT,     "\033[C" },   // cursor right
-        { KEY_LEFT,      "\033[D" },   // cursor left
-        { KEY_HOME,      "\033[H" },   // home
-        { KEY_END,       "\033[F" },   // end
-        { KEY_DELETE,    "\033[3~" },  // delete forward
-        { KEY_PAGE_UP,   "\033[5~" },  // page up
-        { KEY_PAGE_DOWN, "\033[6~" },  // page down
-    };
-    for (size_t i = 0; i < sizeof(key_map) / sizeof(key_map[0]); i++) {
-        if (IsKeyPressed(key_map[i].rl_key) || IsKeyPressedRepeat(key_map[i].rl_key))
-            write(pty_fd, key_map[i].seq, strlen(key_map[i].seq));
+// Return the unshifted Unicode codepoint for a raylib key, i.e. the
+// character the key produces with no modifiers on a US layout.  The
+// Kitty keyboard protocol requires this to identify keys.  Returns 0
+// for keys that don't have a natural codepoint (arrows, F-keys, etc.).
+static uint32_t raylib_key_unshifted_codepoint(int rl_key)
+{
+    if (rl_key >= KEY_A && rl_key <= KEY_Z)
+        return 'a' + (uint32_t)(rl_key - KEY_A);
+    if (rl_key >= KEY_ZERO && rl_key <= KEY_NINE)
+        return '0' + (uint32_t)(rl_key - KEY_ZERO);
+
+    switch (rl_key) {
+    case KEY_SPACE:          return ' ';
+    case KEY_MINUS:          return '-';
+    case KEY_EQUAL:          return '=';
+    case KEY_LEFT_BRACKET:   return '[';
+    case KEY_RIGHT_BRACKET:  return ']';
+    case KEY_BACKSLASH:      return '\\';
+    case KEY_SEMICOLON:      return ';';
+    case KEY_APOSTROPHE:     return '\'';
+    case KEY_COMMA:          return ',';
+    case KEY_PERIOD:         return '.';
+    case KEY_SLASH:          return '/';
+    case KEY_GRAVE:          return '`';
+    default:                 return 0;
+    }
+}
+
+// Encode a single Unicode codepoint into a UTF-8 byte buffer.
+// Returns the number of bytes written (1–4).  Used by handle_input to
+// supply the event's UTF-8 text from GetCharPressed().
+static int input_utf8_encode(int cp, char out[4])
+{
+    if (cp < 0x80) {
+        out[0] = (char)cp;
+        return 1;
+    } else if (cp < 0x800) {
+        out[0] = (char)(0xC0 | (cp >> 6));
+        out[1] = (char)(0x80 | (cp & 0x3F));
+        return 2;
+    } else if (cp < 0x10000) {
+        out[0] = (char)(0xE0 | (cp >> 12));
+        out[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        out[2] = (char)(0x80 | (cp & 0x3F));
+        return 3;
+    } else {
+        out[0] = (char)(0xF0 | (cp >> 18));
+        out[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
+        out[2] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        out[3] = (char)(0x80 | (cp & 0x3F));
+        return 4;
+    }
+}
+
+// Poll raylib for keyboard events and use the libghostty key encoder
+// to produce the correct VT escape sequences, which are then written
+// to the pty.  The encoder respects terminal modes (cursor key
+// application mode, Kitty keyboard protocol, etc.) so we don't need
+// to maintain our own escape-sequence tables.
+static void handle_input(int pty_fd, GhosttyKeyEncoder encoder,
+                         GhosttyKeyEvent event, GhosttyTerminal terminal)
+{
+    // Sync encoder options from the terminal so mode changes (e.g.
+    // application cursor keys, Kitty keyboard protocol) are honoured.
+    ghostty_key_encoder_setopt_from_terminal(encoder, terminal);
+
+    // Drain printable characters from raylib's input queue.  We collect
+    // them into a single UTF-8 buffer so the encoder can attach text
+    // to the key event.
+    char char_utf8[64];
+    int char_utf8_len = 0;
+    int ch;
+    while ((ch = GetCharPressed()) != 0) {
+        char u8[4];
+        int n = input_utf8_encode(ch, u8);
+        if (char_utf8_len + n < (int)sizeof(char_utf8)) {
+            memcpy(&char_utf8[char_utf8_len], u8, n);
+            char_utf8_len += n;
+        }
     }
 
-    // --- 3. Ctrl+letter combos ---
-    // Control characters are 1–26 (ctrl+a through ctrl+z).  Raylib's
-    // KEY_A..KEY_Z constants are contiguous, so we can loop over them.
-    for (int k = KEY_A; k <= KEY_Z; k++) {
-        if ((IsKeyPressed(k) || IsKeyPressedRepeat(k)) && IsKeyDown(KEY_LEFT_CONTROL)) {
-            char ctrl = (char)(k - KEY_A + 1);
-            write(pty_fd, &ctrl, 1);
+    // All raylib keys we want to check for press/repeat events.
+    // Letters and digits are handled via ranges; everything else is
+    // enumerated explicitly.
+    static const int special_keys[] = {
+        KEY_SPACE, KEY_ENTER, KEY_TAB, KEY_BACKSPACE, KEY_DELETE,
+        KEY_ESCAPE, KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT,
+        KEY_HOME, KEY_END, KEY_PAGE_UP, KEY_PAGE_DOWN, KEY_INSERT,
+        KEY_MINUS, KEY_EQUAL, KEY_LEFT_BRACKET, KEY_RIGHT_BRACKET,
+        KEY_BACKSLASH, KEY_SEMICOLON, KEY_APOSTROPHE, KEY_COMMA,
+        KEY_PERIOD, KEY_SLASH, KEY_GRAVE,
+        KEY_F1, KEY_F2, KEY_F3, KEY_F4, KEY_F5, KEY_F6,
+        KEY_F7, KEY_F8, KEY_F9, KEY_F10, KEY_F11, KEY_F12,
+    };
+
+    // Build the set of raylib keys to scan: letters + digits + specials.
+    int keys_to_check[26 + 10 + sizeof(special_keys) / sizeof(special_keys[0])];
+    int num_keys = 0;
+    for (int k = KEY_A; k <= KEY_Z; k++)
+        keys_to_check[num_keys++] = k;
+    for (int k = KEY_ZERO; k <= KEY_NINE; k++)
+        keys_to_check[num_keys++] = k;
+    for (size_t i = 0; i < sizeof(special_keys) / sizeof(special_keys[0]); i++)
+        keys_to_check[num_keys++] = special_keys[i];
+
+    GhosttyMods mods = get_ghostty_mods();
+
+    for (int i = 0; i < num_keys; i++) {
+        int rl_key = keys_to_check[i];
+        bool pressed  = IsKeyPressed(rl_key);
+        bool repeated = IsKeyPressedRepeat(rl_key);
+        bool released = IsKeyReleased(rl_key);
+        if (!pressed && !repeated && !released)
+            continue;
+
+        GhosttyKey gkey = raylib_key_to_ghostty(rl_key);
+        if (gkey == GHOSTTY_KEY_UNIDENTIFIED)
+            continue;
+
+        GhosttyKeyAction action = released  ? GHOSTTY_KEY_ACTION_RELEASE
+                                : pressed   ? GHOSTTY_KEY_ACTION_PRESS
+                                            : GHOSTTY_KEY_ACTION_REPEAT;
+
+        ghostty_key_event_set_key(event, gkey);
+        ghostty_key_event_set_action(event, action);
+        ghostty_key_event_set_mods(event, mods);
+
+        // The unshifted codepoint is the character the key produces
+        // with no modifiers.  The Kitty protocol needs it to identify
+        // keys independent of the current shift state.
+        uint32_t ucp = raylib_key_unshifted_codepoint(rl_key);
+        ghostty_key_event_set_unshifted_codepoint(event, ucp);
+
+        // Consumed mods are modifiers the platform's text input
+        // already accounted for when producing the UTF-8 text.
+        // For printable keys, shift is consumed (it turns 'a' → 'A').
+        // For non-printable keys nothing is consumed.
+        GhosttyMods consumed = 0;
+        if (ucp != 0 && (mods & GHOSTTY_MODS_SHIFT))
+            consumed |= GHOSTTY_MODS_SHIFT;
+        ghostty_key_event_set_consumed_mods(event, consumed);
+
+        // Attach any UTF-8 text that raylib produced for this frame.
+        // For unmodified printable keys this is the character itself;
+        // for special keys or ctrl combos there's typically no text.
+        // Release events never carry text.
+        if (char_utf8_len > 0 && !released) {
+            ghostty_key_event_set_utf8(event, char_utf8, (size_t)char_utf8_len);
+            // Only attach the text to the first key event this frame
+            // to avoid duplicating it.
+            char_utf8_len = 0;
+        } else {
+            ghostty_key_event_set_utf8(event, NULL, 0);
         }
+
+        char buf[128];
+        size_t written = 0;
+        GhosttyResult res = ghostty_key_encoder_encode(
+            encoder, event, buf, sizeof(buf), &written);
+        if (res == GHOSTTY_SUCCESS && written > 0)
+            write(pty_fd, buf, written);
     }
 }
 
@@ -442,6 +586,18 @@ int main(void)
     if (pty_fd < 0)
         return 1;
 
+    // Create the key encoder and a reusable key event for input handling.
+    // The encoder translates key events into the correct VT escape
+    // sequences, respecting terminal modes like application cursor keys
+    // and the Kitty keyboard protocol.
+    GhosttyKeyEncoder key_encoder = NULL;
+    err = ghostty_key_encoder_new(NULL, &key_encoder);
+    assert(err == GHOSTTY_SUCCESS);
+
+    GhosttyKeyEvent key_event = NULL;
+    err = ghostty_key_event_new(NULL, &key_event);
+    assert(err == GHOSTTY_SUCCESS);
+
     // Create the render state and its reusable iterator/cells handles once
     // up front.  These are updated each frame rather than recreated.
     GhosttyRenderState render_state = NULL;
@@ -488,7 +644,7 @@ int main(void)
         pty_read(pty_fd, terminal);
 
         // Forward keyboard input to the shell.
-        handle_input(pty_fd);
+        handle_input(pty_fd, key_encoder, key_event, terminal);
 
         // Snapshot the terminal state into our render state.  This is the
         // only point where we need access to the terminal; after this the
@@ -514,6 +670,8 @@ int main(void)
     close(pty_fd);
     kill(child, SIGHUP);    // signal the child shell to exit
     waitpid(child, NULL, 0); // reap the child to avoid a zombie
+    ghostty_key_event_free(key_event);
+    ghostty_key_encoder_free(key_encoder);
     ghostty_render_state_row_cells_free(row_cells);
     ghostty_render_state_row_iterator_free(row_iter);
     ghostty_render_state_free(render_state);
