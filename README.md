@@ -10,11 +10,12 @@ instead of a direct GPU renderer like the primary [Ghostty](https://ghostty.org)
 showcase the flexibility of libghostty and how it can be used in a variety of
 contexts.
 
-> [!IMPORTANT]
+> [!WARNING]
 >
 > The Ghostling terminal isn't meant to be a full featured, daily use
-> terminal. It is a minimal viable terminal based on libghostty. Still,
-> it supports a lot more features than even the average terminal emulator!
+> terminal. It is a minimal viable terminal based on libghostty. Also, since
+> this is basically a demo, I didn't carefully audit every single place for
+> correctness, and this is C, so you've been warned!
 
 <p align="center">
   <img src="demo.gif" alt="Ghostling Demo" />
