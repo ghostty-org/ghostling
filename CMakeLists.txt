@@ -32,6 +32,10 @@ FetchContent_Declare(ghostty
   GIT_REPOSITORY https://github.com/ghostty-org/ghostty.git
   GIT_TAG main
 )
+# When building in Release mode, tell the Zig build to optimise aggressively.
+if (CMAKE_BUILD_TYPE STREQUAL "Release")
+  set(GHOSTTY_ZIG_BUILD_FLAGS "-Doptimize=ReleaseFast" CACHE STRING "" FORCE)
+endif()
 FetchContent_MakeAvailable(ghostty)
 
 # --- Embed font as a C header ------------------------------------------------

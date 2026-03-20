@@ -93,6 +93,11 @@ cmake --build build
 ./build/ghostling
 ```
 
+> [!WARNING]
+>
+> Debug builds are VERY SLOW since Ghostty included a lot of extra
+> safety and correctness checks. Do not benchmark debug builds.
+
 For a release (optimized) build:
 
 ```sh
