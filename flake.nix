@@ -19,6 +19,7 @@
           packages = with pkgs; [
             cmake
             ninja
+            scc
           ];
 
           # Unset Nix Darwin SDK env vars and remove the xcbuild

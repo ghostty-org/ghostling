@@ -323,17 +323,51 @@ static void handle_mouse(int pty_fd, GhosttyMouseEncoder encoder,
         mouse_encode_and_write(pty_fd, encoder, event);
     }
 
-    // Scroll wheel — encoded as press+release of button 4 (up) or 5 (down).
+    // Scroll wheel handling.  When a mouse tracking mode is active the
+    // wheel events are forwarded to the application as button 4/5
+    // press+release pairs.  Otherwise we scroll the viewport through
+    // the scrollback buffer so the user can review history.
     float wheel = GetMouseWheelMove();
     if (wheel != 0.0f) {
-        GhosttyMouseButton scroll_btn = (wheel > 0.0f)
-            ? GHOSTTY_MOUSE_BUTTON_FOUR
-            : GHOSTTY_MOUSE_BUTTON_FIVE;
-        ghostty_mouse_event_set_button(event, scroll_btn);
-        ghostty_mouse_event_set_action(event, GHOSTTY_MOUSE_ACTION_PRESS);
-        mouse_encode_and_write(pty_fd, encoder, event);
-        ghostty_mouse_event_set_action(event, GHOSTTY_MOUSE_ACTION_RELEASE);
-        mouse_encode_and_write(pty_fd, encoder, event);
+        // Check whether any mouse tracking mode is enabled.  If so,
+        // the application wants to handle scroll events itself.
+        bool mouse_tracking = false;
+        bool mode_val = false;
+        const GhosttyMode tracking_modes[] = {
+            GHOSTTY_MODE_X10_MOUSE,
+            GHOSTTY_MODE_NORMAL_MOUSE,
+            GHOSTTY_MODE_BUTTON_MOUSE,
+            GHOSTTY_MODE_ANY_MOUSE,
+        };
+        for (size_t i = 0; i < sizeof(tracking_modes) / sizeof(tracking_modes[0]); i++) {
+            if (ghostty_terminal_mode_get(terminal, tracking_modes[i], &mode_val) == GHOSTTY_SUCCESS
+                && mode_val) {
+                mouse_tracking = true;
+                break;
+            }
+        }
+
+        if (mouse_tracking) {
+            // Forward to the application via the mouse encoder.
+            GhosttyMouseButton scroll_btn = (wheel > 0.0f)
+                ? GHOSTTY_MOUSE_BUTTON_FOUR
+                : GHOSTTY_MOUSE_BUTTON_FIVE;
+            ghostty_mouse_event_set_button(event, scroll_btn);
+            ghostty_mouse_event_set_action(event, GHOSTTY_MOUSE_ACTION_PRESS);
+            mouse_encode_and_write(pty_fd, encoder, event);
+            ghostty_mouse_event_set_action(event, GHOSTTY_MOUSE_ACTION_RELEASE);
+            mouse_encode_and_write(pty_fd, encoder, event);
+        } else {
+            // Scroll the viewport through scrollback.  Scroll 3 rows
+            // per wheel tick for a comfortable pace.  Delta is negative
+            // to scroll up (into history), positive to scroll down.
+            int delta = (wheel > 0.0f) ? -3 : 3;
+            GhosttyTerminalScrollViewport sv = {
+                .tag = GHOSTTY_SCROLL_VIEWPORT_DELTA,
+                .value = { .delta = delta },
+            };
+            ghostty_terminal_scroll_viewport(terminal, sv);
+        }
     }
 }
 
