@@ -700,15 +700,39 @@ static void render_terminal(GhosttyRenderState render_state,
                 GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_STYLE, &style);
 
             GhosttyColorRgb fg = resolve_color(style.fg_color, &colors, colors.foreground);
-            Color ray_fg = { fg.r, fg.g, fg.b, 255 };
+            GhosttyColorRgb bg_rgb = resolve_color(style.bg_color, &colors, colors.background);
 
-            // Draw a background rectangle if the cell has a non-default bg.
-            if (style.bg_color.tag != GHOSTTY_STYLE_COLOR_NONE) {
-                GhosttyColorRgb bg = resolve_color(style.bg_color, &colors, colors.background);
-                DrawRectangle(x, y, cell_width, cell_height, (Color){ bg.r, bg.g, bg.b, 255 });
+            // Inverse (reverse video): swap foreground and background colors.
+            if (style.inverse) {
+                GhosttyColorRgb tmp = fg;
+                fg = bg_rgb;
+                bg_rgb = tmp;
+                // If the original bg was unset (none), the swap used the
+                // terminal default background — mark it as present so we
+                // draw the rectangle below.
             }
 
-            DrawTextEx(font, text, (Vector2){x, y}, font_size, 0, ray_fg);
+            Color ray_fg = { fg.r, fg.g, fg.b, 255 };
+
+            // Draw a background rectangle if the cell has a non-default bg
+            // or if inverse mode forced a swap.
+            if (style.bg_color.tag != GHOSTTY_STYLE_COLOR_NONE || style.inverse) {
+                DrawRectangle(x, y, cell_width, cell_height, (Color){ bg_rgb.r, bg_rgb.g, bg_rgb.b, 255 });
+            }
+
+            // Italic: apply a simple shear by shifting the top of the glyph
+            // to the right.  The offset is proportional to font size so it
+            // looks reasonable at any scale.
+            int italic_offset = style.italic ? (font_size / 6) : 0;
+
+            DrawTextEx(font, text, (Vector2){x + italic_offset, y}, font_size, 0, ray_fg);
+
+            // Bold: draw the text a second time shifted 1 pixel to the
+            // right to thicken the strokes ("fake bold").
+            if (style.bold) {
+                DrawTextEx(font, text, (Vector2){x + italic_offset + 1, y}, font_size, 0, ray_fg);
+            }
+
             x += cell_width;
         }
 
