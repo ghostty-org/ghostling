@@ -4,11 +4,16 @@
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/release-25.11";
     flake-utils.url = "github:numtide/flake-utils";
+    zig = {
+      url = "github:mitchellh/zig-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs = {
     nixpkgs,
     flake-utils,
+    zig,
     ...
   }:
     flake-utils.lib.eachDefaultSystem (
@@ -16,10 +21,12 @@
         pkgs = nixpkgs.legacyPackages.${system};
       in {
         devShells.default = pkgs.mkShell {
-          packages = with pkgs; [
-            cmake
-            ninja
-            scc
+          packages = [
+            zig.packages.${system}."0.15.2"
+            pkgs.cmake
+            pkgs.ninja
+            pkgs.pinact
+            pkgs.scc
           ];
 
           # Unset Nix Darwin SDK env vars and remove the xcbuild
