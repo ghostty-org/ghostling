@@ -1010,8 +1010,10 @@ int main(void)
     // scrollbar thumb we continuously reposition the viewport.
     bool scrollbar_dragging = false;
 
-    // Set when the child process has exited (EOF on the pty).
+    // Set when the pty signals EOF/error — the child's side is closed.
     bool child_exited = false;
+    // Set once waitpid() successfully reaps the child.
+    bool child_reaped = false;
     int child_exit_status = -1;
 
     // Each frame: handle resize → read pty → process input → render.
@@ -1067,13 +1069,24 @@ int main(void)
         if (!child_exited) {
             PtyReadResult pty_rc = pty_read(pty_fd, terminal);
             if (pty_rc != PTY_READ_OK) {
-                // EOF (1) or error (-1): the child is gone.
+                // EOF or error — the child's side of the pty is closed.
                 child_exited = true;
+            }
+        }
 
-                // Reap the child so we can report its exit status.
-                int wstatus = 0;
-                if (waitpid(child, &wstatus, WNOHANG) > 0 && WIFEXITED(wstatus))
+        // Try to reap the child each frame until we succeed.  The pty
+        // EOF can arrive before the child is waitable, so a single
+        // WNOHANG attempt right at EOF may miss.  We also check for
+        // signal death so the banner can report it properly.
+        if (child_exited && !child_reaped) {
+            int wstatus = 0;
+            pid_t wp = waitpid(child, &wstatus, WNOHANG);
+            if (wp > 0) {
+                child_reaped = true;
+                if (WIFEXITED(wstatus))
                     child_exit_status = WEXITSTATUS(wstatus);
+                else if (WIFSIGNALED(wstatus))
+                    child_exit_status = 128 + WTERMSIG(wstatus);
             }
         }
 
@@ -1144,9 +1157,12 @@ int main(void)
     UnloadFont(mono_font);
     CloseWindow();
     close(pty_fd);
-    if (!child_exited) {
-        kill(child, SIGHUP);    // signal the child shell to exit
-        waitpid(child, NULL, 0); // reap the child to avoid a zombie
+    if (!child_reaped) {
+        // If the child is still running, ask it to exit.  Then do a
+        // blocking waitpid to reap it and avoid leaving a zombie.
+        if (!child_exited)
+            kill(child, SIGHUP);
+        waitpid(child, NULL, 0);
     }
     ghostty_mouse_event_free(mouse_event);
     ghostty_mouse_encoder_free(mouse_encoder);
