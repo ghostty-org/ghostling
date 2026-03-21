@@ -1004,7 +1004,9 @@ int main(void)
     int prev_height = scr_h;
 
     // Track focus state so we only send focus events on transitions.
-    bool prev_focused = true;
+    // Initialize from the actual window state to avoid a spurious
+    // focus-lost event on startup.
+    bool prev_focused = IsWindowFocused();
 
     // Scrollbar drag state — when the user clicks and drags the
     // scrollbar thumb we continuously reposition the viewport.
