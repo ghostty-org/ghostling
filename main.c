@@ -1011,19 +1011,27 @@ int main(void)
             }
         }
 
-        // Send focus in/out events when the window focus state changes.
-        // Applications that enable focus reporting (mode 1004) will
-        // receive CSI I / CSI O sequences.
+        // Send focus in/out events when the window focus state changes,
+        // but only if the application has enabled focus reporting
+        // (DECSET 1004).  Sending CSI I / CSI O unconditionally would
+        // inject unexpected escape sequences into shells that never
+        // asked for them.
         bool focused = IsWindowFocused();
         if (focused != prev_focused) {
-            GhosttyFocusEvent focus_event = focused
-                ? GHOSTTY_FOCUS_GAINED : GHOSTTY_FOCUS_LOST;
-            char focus_buf[8];
-            size_t focus_written = 0;
-            GhosttyResult focus_res = ghostty_focus_encode(
-                focus_event, focus_buf, sizeof(focus_buf), &focus_written);
-            if (focus_res == GHOSTTY_SUCCESS && focus_written > 0)
-                write(pty_fd, focus_buf, focus_written);
+            bool focus_mode = false;
+            if (!child_exited
+                && ghostty_terminal_mode_get(terminal,
+                       GHOSTTY_MODE_FOCUS_EVENT, &focus_mode) == GHOSTTY_SUCCESS
+                && focus_mode) {
+                GhosttyFocusEvent focus_event = focused
+                    ? GHOSTTY_FOCUS_GAINED : GHOSTTY_FOCUS_LOST;
+                char focus_buf[8];
+                size_t focus_written = 0;
+                GhosttyResult focus_res = ghostty_focus_encode(
+                    focus_event, focus_buf, sizeof(focus_buf), &focus_written);
+                if (focus_res == GHOSTTY_SUCCESS && focus_written > 0)
+                    write(pty_fd, focus_buf, focus_written);
+            }
             prev_focused = focused;
         }
 
