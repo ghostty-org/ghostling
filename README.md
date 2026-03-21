@@ -101,8 +101,13 @@ There are some known issues with this demo:
 
 ## Building
 
-Requires CMake 3.19+, a C compiler, and Zig 0.15.x on PATH.
-Raylib is fetched automatically via CMake's FetchContent if not already installed.
+Requirements:
+
+- [CMake](https://cmake.org/) 3.19+
+- [Ninja](https://ninja-build.org/)
+- A C compiler
+- [Zig](https://ziglang.org/) 0.15.x on PATH
+- macOS: [Command Line Tools or Xcode](https://developer.apple.com/xcode/)
 
 ```sh
 cmake -B build -G Ninja
