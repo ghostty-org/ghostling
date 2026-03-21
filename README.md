@@ -88,6 +88,17 @@ These are the things that libghostty consumers are expected to implement
 on their own, if they want them. This example doesn't implement these
 to try to stay as minimal as possible.
 
+### Limitations Due to Upstreams
+
+There are some known issues with this demo:
+
+- Kitty keyboard protocol support is broken with some inputs. This is
+  due to limitations of the underlying Raylib input system; it doesn't
+  support rich enough input events to fully and correctly implement the Kitty
+  keyboard protocol. This is a [known issue](https://github.com/glfw/glfw/issues/1502).
+  The libghostty-vt API supports Kitty keybaord protocol correctly, but
+  requires correct input events to do so.
+
 ## Building
 
 Requires CMake 3.19+, a C compiler, and Zig 0.15.x on PATH.
