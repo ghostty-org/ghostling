@@ -34,7 +34,7 @@ contains no renderer drawing or windowing code; the consumer (Ghostling, in
 this case) provides its own. The core logic is extracted directly from Ghostty
 and inherits all of its real-world benefits: excellent, accurate, and complete
 terminal emulation support, SIMD-optimized parsing, leading Unicode support,
-highly optimized memory usage, and a robust fuzzed and tested codebase, all
+highly optimized memory usage, and a robust, fuzzed, and tested codebase, all
 proven by millions of daily active users of Ghostty GUI.
 
 ## Features
@@ -96,7 +96,7 @@ There are some known issues with this demo:
   due to limitations of the underlying Raylib input system; it doesn't
   support rich enough input events to fully and correctly implement the Kitty
   keyboard protocol. This is a [known issue](https://github.com/glfw/glfw/issues/1502).
-  The libghostty-vt API supports Kitty keybaord protocol correctly, but
+  The libghostty-vt API supports Kitty keyboard protocol correctly, but
   requires correct input events to do so.
 
 ## Building
@@ -127,7 +127,7 @@ cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ```
 
-After the initial configure, you only need to run the build step:
+After the initial configuration, you only need to run the build step:
 
 ```sh
 cmake --build build
