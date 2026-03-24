@@ -8,6 +8,10 @@
       url = "github:mitchellh/zig-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    raylib-src = {
+      url = "github:raysan5/raylib/5.5";
+      flake = false;
+    };
     ghostty-src = {
       url = "github:ghostty-org/ghostty/ecc55b94c803789762682065ab68f227447909c5";
       flake = false;
@@ -18,6 +22,7 @@
     nixpkgs,
     flake-utils,
     zig,
+    raylib-src,
     ghostty-src,
     ...
   }:
@@ -43,10 +48,7 @@
           ];
 
           buildInputs =
-            [
-              pkgs.raylib
-            ]
-            ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
+            pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
               pkgs.xorg.libX11
               pkgs.xorg.libXcursor
               pkgs.xorg.libXrandr
@@ -65,6 +67,7 @@
             chmod -R u+w zig-deps
 
             cmakeFlagsArray+=(
+              "-DFETCHCONTENT_SOURCE_DIR_RAYLIB=${raylib-src}"
               "-DFETCHCONTENT_SOURCE_DIR_GHOSTTY=$PWD/ghostty-local"
               "-DGHOSTTY_ZIG_BUILD_FLAGS=--system;$PWD/zig-deps"
             )
