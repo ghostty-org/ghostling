@@ -75,6 +75,11 @@ if (APPLE)
   target_link_libraries(${PROJECT_NAME} "-framework OpenGL")
 endif()
 
+# Linux requires libutil for forkpty().
+if (UNIX AND NOT APPLE)
+  target_link_libraries(${PROJECT_NAME} util)
+endif()
+
 # Windows: ConPTY APIs (used for terminal emulation) are provided by kernel32.lib,
 # which is linked implicitly by default on all Windows compilers (MSVC, MinGW-w64, Clang).
 # No explicit target_link_libraries() call is needed for Windows.

@@ -44,7 +44,7 @@
           shellHook = ''
             unset SDKROOT
             unset DEVELOPER_DIR
-            export PATH=$(echo "$PATH" | tr ':' '\n' | grep -v xcbuild | tr '\n' ':')
+            export PATH=$(echo "$PATH" | tr ':' '\n' | grep -v -e xcbuild -e apple-sdk | tr '\n' ':')
           '';
         };
       }

@@ -943,9 +943,20 @@ static void handle_input(PtyHandle pty_fd, GhosttyKeyEncoder encoder,
         size_t written = 0;
         GhosttyResult res = ghostty_key_encoder_encode(
             encoder, event, buf, sizeof(buf), &written);
-        if (res == GHOSTTY_SUCCESS && written > 0)
+        if (res == GHOSTTY_SUCCESS && written > 0) {
             pty_write(pty_fd, buf, written);
+            // Text was consumed by the encoder — clear it so the
+            // fallback below doesn't double-send.
+            char_utf8_len = 0;
+        }
     }
+
+    // Fallback: on some platforms (e.g. VMs) the character event arrives
+    // a frame after the key-press event.  If we collected UTF-8 text but
+    // no key event consumed it, write it directly to the PTY so input
+    // isn't silently dropped.
+    if (char_utf8_len > 0)
+        pty_write(pty_fd, char_utf8, char_utf8_len);
 }
 
 // Handle scrollbar drag-to-scroll.  When the user clicks in the
