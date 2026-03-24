@@ -108,6 +108,7 @@ Requirements:
 - A C compiler
 - [Zig](https://ziglang.org/) 0.15.x on PATH
 - macOS: [Command Line Tools or Xcode](https://developer.apple.com/xcode/)
+- Linux (Ubuntu/Debian): `sudo apt install -y ninja-build build-essential git libxinerama-dev libxcursor-dev libxrandr-dev libxi-dev libxext-dev libx11-dev libgl-dev`
 
 ```sh
 cmake -B build -G Ninja

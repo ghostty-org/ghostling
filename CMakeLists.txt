@@ -62,3 +62,8 @@ if (APPLE)
   target_link_libraries(${PROJECT_NAME} "-framework Cocoa")
   target_link_libraries(${PROJECT_NAME} "-framework OpenGL")
 endif()
+
+# Linux requires libutil for forkpty().
+if (UNIX AND NOT APPLE)
+  target_link_libraries(${PROJECT_NAME} util)
+endif()
