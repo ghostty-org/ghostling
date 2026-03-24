@@ -59,3 +59,22 @@ jobs:
         run: |
           nix develop -c cmake -B build -G Ninja
           nix develop -c cmake --build build
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Setup Ninja
+        uses: seanmiddleditch/gha-setup-ninja@7e868db0f3406270dd46e1dac26c65f621456723 # master
+
+      - name: Build
+        run: |
+          cmake -B build -G Ninja
+          cmake --build build

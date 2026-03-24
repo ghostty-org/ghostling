@@ -30,7 +30,7 @@ endif()
 # required Zig version.
 FetchContent_Declare(ghostty
   GIT_REPOSITORY https://github.com/ghostty-org/ghostty.git
-  GIT_TAG ecc55b94c803789762682065ab68f227447909c5
+  GIT_TAG d4a38c8661453026bd1b1bb022ba2c37b347adce
 )
 FetchContent_MakeAvailable(ghostty)
 
@@ -56,9 +56,25 @@ target_compile_features(${PROJECT_NAME} PRIVATE c_std_11)
 target_include_directories(${PROJECT_NAME} PRIVATE "${CMAKE_BINARY_DIR}")
 target_link_libraries(${PROJECT_NAME} raylib ghostty-vt)
 
+# Build as a GUI subsystem app on Windows so we don't get a console window.
+# Without this, the child shell inherits our console and writes there instead
+# of through the ConPTY pipe.  We keep main() as the entry point.
+if(WIN32)
+  set_target_properties(${PROJECT_NAME} PROPERTIES WIN32_EXECUTABLE TRUE)
+  # MSVC/Clang need an explicit entry point override to keep main() as the
+  # entry point in a GUI subsystem app.  MinGW handles this automatically.
+  if(MSVC OR (CMAKE_C_COMPILER_ID STREQUAL "Clang" AND NOT MINGW))
+    target_link_options(${PROJECT_NAME} PRIVATE "LINKER:/ENTRY:mainCRTStartup")
+  endif()
+endif()
+
 # macOS requires these system frameworks for raylib's windowing/input/rendering.
 if (APPLE)
   target_link_libraries(${PROJECT_NAME} "-framework IOKit")
   target_link_libraries(${PROJECT_NAME} "-framework Cocoa")
   target_link_libraries(${PROJECT_NAME} "-framework OpenGL")
 endif()
+
+# Windows: ConPTY APIs (used for terminal emulation) are provided by kernel32.lib,
+# which is linked implicitly by default on all Windows compilers (MSVC, MinGW-w64, Clang).
+# No explicit target_link_libraries() call is needed for Windows.
