@@ -111,7 +111,8 @@ cmake --build build
 ```
 
 On Windows, ghostling uses ConPTY and auto-detects the best available
-shell (pwsh > powershell > cmd). Use `--shell <path>` to override.
+shell (pwsh > powershell > cmd). Pass a shell path as the first argument
+to override (e.g. `ghostling.exe C:\Windows\System32\cmd.exe`).
 
 > [!WARNING]
 >

@@ -1,6 +1,3 @@
-// ---------------------------------------------------------------------------
-// Platform-independent headers
-// ---------------------------------------------------------------------------
 #include <assert.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -1254,13 +1251,7 @@ static void log_build_info(void)
 
 int main(int argc, char *argv[])
 {
-    // Parse --shell <path> flag for explicit shell selection.
-    const char *shell_override = NULL;
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--shell") == 0 && i + 1 < argc) {
-            shell_override = argv[++i];
-        }
-    }
+    const char *shell_override = (argc > 1) ? argv[1] : NULL;
 
     log_build_info();
 
