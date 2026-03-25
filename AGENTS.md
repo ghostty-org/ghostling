@@ -7,6 +7,7 @@
 - Build: `cmake --build build`
 - Release build: `cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release`
 - Run: `./build/ghostling`
+- Clean: `cmake --build build --target clean`
 
 ## Code Conventions
 

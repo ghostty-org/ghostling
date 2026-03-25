@@ -134,6 +134,12 @@ After the initial configuration, you only need to run the build step:
 cmake --build build
 ```
 
+To clean up the build directory:
+
+```sh
+cmake --build build --target clean
+```
+
 ## FAQ
 
 ### Why Not Zig?
