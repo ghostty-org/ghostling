@@ -1270,7 +1270,7 @@ static void log_build_info(void)
 // callbacks so they can reach the pty fd (and anything else they need)
 // without global state.
 typedef struct {
-    int pty_fd;
+    PtyHandle pty_fd;
     int cell_width;
     int cell_height;
     uint16_t cols;
@@ -1484,8 +1484,6 @@ int main(int argc, char *argv[])
         goto cleanup;
     }
     PtyHandle pty_wr = pty_ctx.pipe_in;
-    // On Windows, the effects context uses pipe_in as the pty fd equivalent
-    effects_ctx.pty_fd = (int)(intptr_t)pty_ctx.pipe_in;
 #else
     pty_fd = pty_spawn(&child, term_cols, term_rows, shell_override,
                        cell_width, cell_height);
@@ -1501,8 +1499,13 @@ int main(int argc, char *argv[])
     // vim, tmux, and htop send during startup.  Without these, query
     // sequences are silently dropped and those programs may hang or
     // fall back to degraded behavior.
+#ifdef _WIN32
+    EffectsContext effects_ctx = {
+        .pty_fd = pty_ctx.pipe_in,
+#else
     EffectsContext effects_ctx = {
         .pty_fd = pty_fd,
+#endif
         .cell_width = cell_width,
         .cell_height = cell_height,
         .cols = term_cols,
