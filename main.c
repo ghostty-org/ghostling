@@ -1,6 +1,52 @@
+#include <assert.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+// ---------------------------------------------------------------------------
+// Platform-specific headers and types
+// ---------------------------------------------------------------------------
+#ifdef _WIN32
+// Windows pseudo-console (ConPTY) and process management.
+// WIN32_LEAN_AND_MEAN excludes multimedia APIs whose PlaySound macro
+// clashes with raylib.  NOGDI and NOUSER exclude the WinGDI/WinUser
+// subsystems whose symbols (Rectangle, CloseWindow, ShowCursor) also
+// clash.  Our ConPTY code only needs kernel32/processthreadsapi/consoleapi
+// which remain available.
+#define WIN32_LEAN_AND_MEAN
+#define NOGDI
+#define NOUSER
+#include <windows.h>
+#include <process.h>
+
+// Holds everything needed to drive a ConPTY session: the pseudo-console
+// itself, the child process, and the two pipe ends we use for I/O.
+typedef struct {
+    HPCON hpc;           // pseudo-console handle
+    HANDLE process;      // child process handle
+    HANDLE pipe_in;      // write pipe (our end -> child stdin)
+    HANDLE pipe_out;     // read pipe (child stdout -> our end)
+} PtyContext;
+
+// Convenience wrapper around GetLastError() so Windows error paths
+// produce human-readable messages just like Unix perror().
+static void win_perror(const char *prefix) {
+    DWORD err = GetLastError();
+    char *msg = NULL;
+    FormatMessageA(
+        FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM |
+        FORMAT_MESSAGE_IGNORE_INSERTS,
+        NULL, err, 0, (char *)&msg, 0, NULL);
+    if (msg) {
+        fprintf(stderr, "%s: %s (error %lu)\n", prefix, msg, (unsigned long)err);
+        LocalFree(msg);
+    } else {
+        fprintf(stderr, "%s: error %lu\n", prefix, (unsigned long)err);
+    }
+}
+
+#else /* Unix */
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
@@ -13,6 +59,16 @@
 #include <util.h>
 #else
 #include <pty.h>
+#endif
+#endif /* _WIN32 */
+
+// Unified file-descriptor / handle type so that pty_read, pty_write,
+// handle_input, handle_mouse, etc. share a single signature across
+// both platforms.
+#ifdef _WIN32
+typedef HANDLE PtyHandle;
+#else
+typedef int PtyHandle;
 #endif
 
 #include "raylib.h"
@@ -27,13 +83,202 @@
 // PTY helpers
 // ---------------------------------------------------------------------------
 
+#ifdef _WIN32
+// Spawn the user's default shell inside a Windows pseudo-console (ConPTY).
+//
+// ConPTY is the Windows equivalent of Unix pty: it gives us a VT-capable
+// pseudo-terminal backed by a pair of pipes.  The child process (shell)
+// inherits the console, and we communicate through the pipe ends.
+//
+// If shell_override is non-NULL, it is used as the shell command.
+// Otherwise the shell is auto-detected (first match wins):
+//   1. pwsh.exe   — PowerShell Core (cross-platform, preferred)
+//   2. powershell.exe — Windows PowerShell (ships with Windows)
+//   3. cmd.exe    — ultimate fallback
+//
+// Returns true on success with ctx fully populated, false on failure.
+static bool pty_spawn_win32(PtyContext *ctx, uint16_t cols, uint16_t rows,
+                            const char *shell_override)
+{
+    HANDLE pipe_child_read  = INVALID_HANDLE_VALUE;
+    HANDLE pipe_child_write = INVALID_HANDLE_VALUE;
+    HANDLE pipe_our_read    = INVALID_HANDLE_VALUE;
+    HANDLE pipe_our_write   = INVALID_HANDLE_VALUE;
+    LPPROC_THREAD_ATTRIBUTE_LIST attr_list = NULL;
+    bool attr_list_initialized = false;
+    HPCON hpc = INVALID_HANDLE_VALUE;
+
+    // Zero-initialize so callers can safely check fields on failure.
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->hpc     = INVALID_HANDLE_VALUE;
+    ctx->process = INVALID_HANDLE_VALUE;
+    ctx->pipe_in = INVALID_HANDLE_VALUE;
+    ctx->pipe_out = INVALID_HANDLE_VALUE;
+
+    // --- Pipes ---
+    // We need two pipes: one for the child's stdin (we write, child reads)
+    // and one for the child's stdout (child writes, we read).  ConPTY sits
+    // in between and translates VT sequences.
+    // Pipes must be inheritable — ConPTY uses the handles directly rather
+    // than duplicating them.
+    SECURITY_ATTRIBUTES sa = { .nLength = sizeof(SECURITY_ATTRIBUTES),
+                               .bInheritHandle = TRUE };
+    if (!CreatePipe(&pipe_child_read, &pipe_our_write, &sa, 0)) {
+        win_perror("CreatePipe (child stdin)");
+        goto cleanup;
+    }
+    if (!CreatePipe(&pipe_our_read, &pipe_child_write, &sa, 0)) {
+        win_perror("CreatePipe (child stdout)");
+        goto cleanup;
+    }
+
+    // --- Pseudo-console ---
+    // CreatePseudoConsole duplicates the child-side pipe handles internally.
+    // We must close our copies afterwards to avoid leaking them and to
+    // ensure the pipe signals EOF correctly when the console closes.
+    COORD con_size = { .X = (SHORT)cols, .Y = (SHORT)rows };
+    HRESULT hr = CreatePseudoConsole(con_size, pipe_child_read,
+                                     pipe_child_write, 0, &hpc);
+    if (FAILED(hr)) {
+        fprintf(stderr, "CreatePseudoConsole failed: HRESULT 0x%08lX\n",
+                (unsigned long)hr);
+        goto cleanup;
+    }
+
+    // ConPTY duplicates these handles internally (per Microsoft docs).
+    // Close our copies to keep ref-counts correct.
+    CloseHandle(pipe_child_read);  pipe_child_read  = INVALID_HANDLE_VALUE;
+    CloseHandle(pipe_child_write); pipe_child_write = INVALID_HANDLE_VALUE;
+
+    // --- Startup info with pseudo-console attribute ---
+    // STARTUPINFOEXW carries a proc-thread attribute list that lets us
+    // attach the pseudo-console to the child process.
+    SIZE_T attr_size = 0;
+    // First call: query required buffer size (expected to fail with
+    // ERROR_INSUFFICIENT_BUFFER).
+    InitializeProcThreadAttributeList(NULL, 1, 0, &attr_size);
+    attr_list = (LPPROC_THREAD_ATTRIBUTE_LIST)HeapAlloc(
+        GetProcessHeap(), 0, attr_size);
+    if (!attr_list) {
+        win_perror("HeapAlloc (attribute list)");
+        goto cleanup;
+    }
+    if (!InitializeProcThreadAttributeList(attr_list, 1, 0, &attr_size)) {
+        win_perror("InitializeProcThreadAttributeList");
+        goto cleanup;
+    }
+    attr_list_initialized = true;
+    if (!UpdateProcThreadAttribute(attr_list, 0,
+                                   PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
+                                   hpc, sizeof(HPCON), NULL, NULL)) {
+        win_perror("UpdateProcThreadAttribute (PSEUDOCONSOLE)");
+        goto cleanup;
+    }
+
+    STARTUPINFOEXW si;
+    memset(&si, 0, sizeof(si));
+    si.StartupInfo.cb = sizeof(STARTUPINFOEXW);
+    si.lpAttributeList = attr_list;
+    // Prevent the child from inheriting our (possibly redirected)
+    // standard handles.  Without this, the child writes to inherited
+    // stdout/stderr instead of through the ConPTY pipe — a known
+    // issue when the host process is launched from mintty, VS Code
+    // terminal, or any environment that redirects console handles.
+    si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    si.StartupInfo.hStdInput  = NULL;
+    si.StartupInfo.hStdOutput = NULL;
+    si.StartupInfo.hStdError  = NULL;
+
+    // --- Shell detection ---
+    // If a shell was explicitly requested via --shell, use it.
+    // Otherwise probe for modern shells first (pwsh, powershell)
+    // and fall back to cmd.exe.  We deliberately skip %COMSPEC%
+    // because it almost always resolves to cmd.exe and masks the
+    // better options.
+    wchar_t shell_cmd[MAX_PATH];
+    wchar_t search_buf[MAX_PATH];
+
+    if (shell_override && shell_override[0] != '\0') {
+        if (!MultiByteToWideChar(CP_UTF8, 0, shell_override, -1,
+                                 shell_cmd, MAX_PATH)) {
+            win_perror("MultiByteToWideChar (--shell)");
+            goto cleanup;
+        }
+    } else if (SearchPathW(NULL, L"pwsh.exe", NULL, MAX_PATH,
+                            search_buf, NULL)) {
+        wcscpy_s(shell_cmd, MAX_PATH, search_buf);
+    } else if (SearchPathW(NULL, L"powershell.exe", NULL, MAX_PATH,
+                            search_buf, NULL)) {
+        wcscpy_s(shell_cmd, MAX_PATH, search_buf);
+    } else {
+        // cmd.exe is always present on Windows.
+        wcscpy_s(shell_cmd, MAX_PATH, L"cmd.exe");
+    }
+
+    // --- Set TERM ---
+    // Many CLI tools check TERM to decide what escape sequences to emit.
+    // xterm-256color is the de-facto standard for modern terminals.
+    SetEnvironmentVariableA("TERM", "xterm-256color");
+
+    // --- Spawn the child process ---
+    PROCESS_INFORMATION pi;
+    memset(&pi, 0, sizeof(pi));
+    if (!CreateProcessW(NULL, shell_cmd, NULL, NULL, FALSE,
+                        EXTENDED_STARTUPINFO_PRESENT, NULL, NULL,
+                        &si.StartupInfo, &pi)) {
+        win_perror("CreateProcessW");
+        goto cleanup;
+    }
+
+    // We only need the process handle; the thread can run freely.
+    CloseHandle(pi.hThread);
+
+    // --- Clean up attribute list ---
+    // No longer needed once the process is created.
+    DeleteProcThreadAttributeList(attr_list);
+    HeapFree(GetProcessHeap(), 0, attr_list);
+    attr_list = NULL;
+
+    // --- Populate context ---
+    ctx->hpc      = hpc;
+    ctx->process  = pi.hProcess;
+    ctx->pipe_in  = pipe_our_write;
+    ctx->pipe_out = pipe_our_read;
+
+    // Send an initial carriage return to prod ConPTY into flushing
+    // the child's startup output through the output pipe.
+    DWORD kick = 0;
+    WriteFile(pipe_our_write, "\r", 1, &kick, NULL);
+
+    return true;
+
+cleanup:
+    // Release everything that was successfully allocated up to the
+    // point of failure, in reverse order.
+    if (attr_list) {
+        if (attr_list_initialized)
+            DeleteProcThreadAttributeList(attr_list);
+        HeapFree(GetProcessHeap(), 0, attr_list);
+    }
+    if (hpc != INVALID_HANDLE_VALUE)
+        ClosePseudoConsole(hpc);
+    if (pipe_child_read  != INVALID_HANDLE_VALUE) CloseHandle(pipe_child_read);
+    if (pipe_child_write != INVALID_HANDLE_VALUE) CloseHandle(pipe_child_write);
+    if (pipe_our_read    != INVALID_HANDLE_VALUE) CloseHandle(pipe_our_read);
+    if (pipe_our_write   != INVALID_HANDLE_VALUE) CloseHandle(pipe_our_write);
+    return false;
+}
+#endif /* _WIN32 */
+
+#ifndef _WIN32
 // Spawn the user's default shell in a new pseudo-terminal.
 //
 // Creates a pty pair via forkpty(), sets the initial window size, execs the
 // shell in the child, and puts the master fd into non-blocking mode so we
 // can poll it each frame without stalling the render loop.
 //
-// The shell is chosen by checking, in order:
+// If shell_override is non-NULL, it is used directly.  Otherwise the
+// shell is chosen by checking, in order:
 //   1. $SHELL environment variable
 //   2. The pw_shell field from the passwd database
 //   3. /bin/sh as a last resort
@@ -41,6 +286,7 @@
 // Returns the master fd on success (>= 0) and stores the child pid in
 // *child_out.  Returns -1 on failure.
 static int pty_spawn(pid_t *child_out, uint16_t cols, uint16_t rows,
+                     const char *shell_override,
                      int cell_width, int cell_height)
 {
     int pty_fd;
@@ -59,16 +305,17 @@ static int pty_spawn(pid_t *child_out, uint16_t cols, uint16_t rows,
         return -1;
     }
     if (child == 0) {
-        // Determine the user's preferred shell.  We try $SHELL first (the
-        // standard convention), then fall back to the passwd entry, and
-        // finally to /bin/sh if nothing else is available.
-        const char *shell = getenv("SHELL");
+        // Use the explicit override if provided, otherwise auto-detect.
+        const char *shell = shell_override;
         if (!shell || shell[0] == '\0') {
-            struct passwd *pw = getpwuid(getuid());
-            if (pw && pw->pw_shell && pw->pw_shell[0] != '\0')
-                shell = pw->pw_shell;
-            else
-                shell = "/bin/sh";
+            shell = getenv("SHELL");
+            if (!shell || shell[0] == '\0') {
+                struct passwd *pw = getpwuid(getuid());
+                if (pw && pw->pw_shell && pw->pw_shell[0] != '\0')
+                    shell = pw->pw_shell;
+                else
+                    shell = "/bin/sh";
+            }
         }
 
         // Extract just the program name for argv[0] (e.g. "/bin/zsh" → "zsh").
@@ -94,13 +341,167 @@ static int pty_spawn(pid_t *child_out, uint16_t cols, uint16_t rows,
     *child_out = child;
     return pty_fd;
 }
+#endif /* _WIN32 */
+
+// Result of draining the pty — shared by both platforms so callers
+// (the main loop) can handle EOF / errors uniformly.
+typedef enum {
+    PTY_READ_OK,    // data was drained (or nothing available right now)
+    PTY_READ_EOF,   // the child closed its end of the pty
+    PTY_READ_ERROR, // a real read error occurred
+} PtyReadResult;
+
+#ifdef _WIN32
+// ---------------------------------------------------------------------------
+// Windows pty_write / pty_read — use HANDLE-based I/O (WriteFile / ReadFile).
+// ---------------------------------------------------------------------------
+
+// Best-effort write to the ConPTY input pipe.  WriteFile on a pipe
+// handle can produce partial writes, so we loop just like the Unix
+// version.  If the pipe is broken (child exited) we silently drop
+// the remainder — there is nobody listening any more.
+static void pty_write(PtyHandle pipe_in, const char *buf, size_t len)
+{
+    while (len > 0) {
+        DWORD written = 0;
+        if (!WriteFile(pipe_in, buf, (DWORD)len, &written, NULL) || written == 0) {
+            // Pipe broken, zero-progress, or error — drop remainder.
+            // This mirrors the Unix path where EAGAIN silently drops under
+            // back-pressure.
+            break;
+        }
+        buf += written;
+        len -= (size_t)written;
+    }
+}
+
+// --- Threaded pipe reader for ConPTY ---
+// ConPTY output pipes do not work reliably with PeekNamedPipe — the
+// available byte count may stay at zero even when data is pending.
+// The canonical pattern (used by Windows Terminal) is to block on
+// ReadFile in a dedicated thread and buffer the results for the
+// main loop to drain each frame.
+
+#define PTY_BUF_SIZE 65536
+
+typedef struct {
+    CRITICAL_SECTION cs;
+    uint8_t data[PTY_BUF_SIZE];
+    size_t len;             // bytes currently buffered
+    bool eof;               // reader thread sets when pipe closes
+    HANDLE pipe;            // the ConPTY output pipe
+} PtyReadBuf;
+
+// Reader thread — blocks on ReadFile until the pipe closes.
+static DWORD WINAPI pty_reader_thread(LPVOID param)
+{
+    PtyReadBuf *rb = (PtyReadBuf *)param;
+    uint8_t tmp[4096];
+    for (;;) {
+        DWORD n = 0;
+        if (!ReadFile(rb->pipe, tmp, sizeof(tmp), &n, NULL) || n == 0) {
+            EnterCriticalSection(&rb->cs);
+            rb->eof = true;
+            LeaveCriticalSection(&rb->cs);
+            return 0;
+        }
+        // Append to buffer under lock.  If buffer is full, spin-wait
+        // (the main loop drains it every ~16ms so this rarely stalls).
+        DWORD written = 0;
+        while (written < n) {
+            EnterCriticalSection(&rb->cs);
+            size_t space = PTY_BUF_SIZE - rb->len;
+            if (space > 0) {
+                size_t chunk = (n - written) < space ? (n - written) : space;
+                memcpy(rb->data + rb->len, tmp + written, chunk);
+                rb->len += chunk;
+                written += (DWORD)chunk;
+            }
+            LeaveCriticalSection(&rb->cs);
+            if (written < n)
+                Sleep(1);  // yield if buffer was full
+        }
+    }
+}
+
+// Drain buffered data from the read buffer into the terminal.
+// Called from the main loop each frame.
+static PtyReadResult pty_buf_drain(PtyReadBuf *rb,
+                                    GhosttyTerminal terminal)
+{
+    uint8_t local[PTY_BUF_SIZE];
+    size_t count = 0;
+    bool is_eof = false;
+
+    EnterCriticalSection(&rb->cs);
+    count = rb->len;
+    if (count > 0) {
+        memcpy(local, rb->data, count);
+        rb->len = 0;
+    }
+    is_eof = rb->eof;
+    LeaveCriticalSection(&rb->cs);
+
+    if (count > 0) {
+        ghostty_terminal_vt_write(terminal, local, count);
+    }
+
+    if (count == 0 && is_eof)
+        return PTY_READ_EOF;
+    return PTY_READ_OK;
+}
+
+// Notify the pseudo-console that the terminal grid changed.  ConPTY
+// forwards this as a SIGWINCH-equivalent to the child process, which
+// allows interactive programs (shells, editors, …) to re-wrap their
+// output to the new dimensions.
+static void pty_resize(HPCON hpc, uint16_t cols, uint16_t rows)
+{
+    COORD size = { .X = (SHORT)cols, .Y = (SHORT)rows };
+    HRESULT hr = ResizePseudoConsole(hpc, size);
+    if (FAILED(hr))
+        fprintf(stderr, "ResizePseudoConsole failed: HRESULT 0x%08lX\n",
+                (unsigned long)hr);
+}
+
+// Tear down the non-console parts of a ConPTY session (process and
+// pipes).  The pseudo-console (hpc) is intentionally NOT closed here
+// — main() closes it separately to control shutdown ordering (the
+// reader thread must be joined between closing hpc and cleaning up).
+static void pty_cleanup(PtyContext *ctx)
+{
+    // Give the child up to 1 second to exit gracefully before
+    // forcibly terminating.  This avoids data loss from an
+    // immediate TerminateProcess.
+    if (ctx->process != INVALID_HANDLE_VALUE) {
+        if (WaitForSingleObject(ctx->process, 1000) != WAIT_OBJECT_0)
+            TerminateProcess(ctx->process, 1);
+        CloseHandle(ctx->process);
+        ctx->process = INVALID_HANDLE_VALUE;
+    }
+
+    if (ctx->pipe_in != INVALID_HANDLE_VALUE) {
+        CloseHandle(ctx->pipe_in);
+        ctx->pipe_in = INVALID_HANDLE_VALUE;
+    }
+    if (ctx->pipe_out != INVALID_HANDLE_VALUE) {
+        CloseHandle(ctx->pipe_out);
+        ctx->pipe_out = INVALID_HANDLE_VALUE;
+    }
+}
+#endif /* _WIN32 */
+
+#ifndef _WIN32
+// ---------------------------------------------------------------------------
+// Unix pty_write / pty_read / pty_resize — fd-based I/O.
+// ---------------------------------------------------------------------------
 
 // Best-effort write to the pty master fd.  Because the fd is
 // non-blocking, write() may return short or fail with EAGAIN.  We
 // retry on EINTR, advance past partial writes, and silently drop
 // data if the kernel buffer is full (EAGAIN) — this matches what
 // most terminal emulators do under back-pressure.
-static void pty_write(int pty_fd, const char *buf, size_t len)
+static void pty_write(PtyHandle pty_fd, const char *buf, size_t len)
 {
     while (len > 0) {
         ssize_t n = write(pty_fd, buf, len);
@@ -116,20 +517,13 @@ static void pty_write(int pty_fd, const char *buf, size_t len)
     }
 }
 
-// Result of draining the pty master fd.
-typedef enum {
-    PTY_READ_OK,    // data was drained (or EAGAIN, i.e. nothing available right now)
-    PTY_READ_EOF,   // the child closed its end of the pty
-    PTY_READ_ERROR, // a real read error occurred
-} PtyReadResult;
-
 // Drain all available output from the pty master and feed it into the
 // ghostty terminal.  The terminal's VT parser will process any escape
 // sequences and update its internal screen/cursor/style state.
 //
 // Because the fd is non-blocking, read() returns -1 with EAGAIN once
 // the kernel buffer is empty, at which point we stop.
-static PtyReadResult pty_read(int pty_fd, GhosttyTerminal terminal)
+static PtyReadResult pty_read(PtyHandle pty_fd, GhosttyTerminal terminal)
 {
     uint8_t buf[4096];
     for (;;) {
@@ -154,6 +548,15 @@ static PtyReadResult pty_read(int pty_fd, GhosttyTerminal terminal)
         }
     }
 }
+
+// Notify the pty that the terminal grid changed so the child process
+// (shell, editor, …) can re-wrap its output to the new dimensions.
+static void pty_resize(PtyHandle pty_fd, uint16_t cols, uint16_t rows)
+{
+    struct winsize ws = { .ws_row = rows, .ws_col = cols };
+    ioctl(pty_fd, TIOCSWINSZ, &ws);
+}
+#endif /* _WIN32 */
 
 // ---------------------------------------------------------------------------
 // Input handling
@@ -304,7 +707,7 @@ static GhosttyMouseButton raylib_mouse_to_ghostty(int rl_button)
 // Encode a mouse event and write the resulting escape sequence to the pty.
 // If the encoder produces no output (e.g. tracking is disabled), this is
 // a no-op.
-static void mouse_encode_and_write(int pty_fd, GhosttyMouseEncoder encoder,
+static void mouse_encode_and_write(PtyHandle pty_fd, GhosttyMouseEncoder encoder,
                                    GhosttyMouseEvent event)
 {
     char buf[128];
@@ -320,7 +723,7 @@ static void mouse_encode_and_write(int pty_fd, GhosttyMouseEncoder encoder,
 // to the pty.  The encoder handles tracking mode (X10, normal, button,
 // any-event) and output format (X10, UTF8, SGR, URxvt, SGR-Pixels)
 // based on what the terminal application has requested.
-static void handle_mouse(int pty_fd, GhosttyMouseEncoder encoder,
+static void handle_mouse(PtyHandle pty_fd, GhosttyMouseEncoder encoder,
                          GhosttyMouseEvent event, GhosttyTerminal terminal,
                          int cell_width, int cell_height, int pad)
 {
@@ -431,10 +834,10 @@ static void handle_mouse(int pty_fd, GhosttyMouseEncoder encoder,
             // Scroll the viewport through scrollback.  Scroll 3 rows
             // per wheel tick for a comfortable pace.  Delta is negative
             // to scroll up (into history), positive to scroll down.
-            int delta = (wheel > 0.0f) ? -3 : 3;
+            int scroll_delta = (wheel > 0.0f) ? -3 : 3;
             GhosttyTerminalScrollViewport sv = {
                 .tag = GHOSTTY_SCROLL_VIEWPORT_DELTA,
-                .value = { .delta = delta },
+                .value = { .delta = scroll_delta },
             };
             ghostty_terminal_scroll_viewport(terminal, sv);
         }
@@ -446,7 +849,7 @@ static void handle_mouse(int pty_fd, GhosttyMouseEncoder encoder,
 // to the pty.  The encoder respects terminal modes (cursor key
 // application mode, Kitty keyboard protocol, etc.) so we don't need
 // to maintain our own escape-sequence tables.
-static void handle_input(int pty_fd, GhosttyKeyEncoder encoder,
+static void handle_input(PtyHandle pty_fd, GhosttyKeyEncoder encoder,
                          GhosttyKeyEvent event, GhosttyTerminal terminal)
 {
     // Sync encoder options from the terminal so mode changes (e.g.
@@ -868,7 +1271,7 @@ static void log_build_info(void)
 // callbacks so they can reach the pty fd (and anything else they need)
 // without global state.
 typedef struct {
-    int pty_fd;
+    PtyHandle pty_fd;
     int cell_width;
     int cell_height;
     uint16_t cols;
@@ -970,8 +1373,10 @@ static bool effect_color_scheme(GhosttyTerminal terminal, void *userdata,
 // Main
 // ---------------------------------------------------------------------------
 
-int main(void)
+int main(int argc, char *argv[])
 {
+    const char *shell_override = (argc > 1) ? argv[1] : NULL;
+
     log_build_info();
 
     // Desired font size in logical (screen) points — the actual texture
@@ -1032,8 +1437,18 @@ int main(void)
     // Initialize all resource handles to safe defaults so the cleanup
     // label can free only what was successfully allocated.
     GhosttyTerminal terminal = NULL;
+#ifdef _WIN32
+    PtyContext pty_ctx = {
+        .hpc = INVALID_HANDLE_VALUE, .process = INVALID_HANDLE_VALUE,
+        .pipe_in = INVALID_HANDLE_VALUE, .pipe_out = INVALID_HANDLE_VALUE,
+    };
+    PtyReadBuf pty_rb = {0};
+    InitializeCriticalSection(&pty_rb.cs);
+    HANDLE pty_reader = NULL;
+#else
     pid_t child = -1;
     int pty_fd = -1;
+#endif
     GhosttyKeyEncoder key_encoder = NULL;
     GhosttyKeyEvent key_event = NULL;
     GhosttyMouseEncoder mouse_encoder = NULL;
@@ -1054,22 +1469,44 @@ int main(void)
         goto cleanup;
     }
 
-    // Spawn a child shell connected to a pseudo-terminal.  The master fd
-    // is what we read/write; the child's stdin/stdout/stderr are wired to
-    // the slave side.
-    pty_fd = pty_spawn(&child, term_cols, term_rows, cell_width, cell_height);
+    // Spawn a child shell connected to a pseudo-terminal.  We read/write
+    // through one end; the child's I/O is wired to the other.
+#ifdef _WIN32
+    if (!pty_spawn_win32(&pty_ctx, term_cols, term_rows, shell_override)) {
+        exit_code = 1;
+        goto cleanup;
+    }
+    // Start the reader thread that blocks on ReadFile and fills the ring.
+    pty_rb.pipe = pty_ctx.pipe_out;
+    pty_reader = CreateThread(NULL, 0, pty_reader_thread, &pty_rb, 0, NULL);
+    if (!pty_reader) {
+        win_perror("CreateThread (pty reader)");
+        exit_code = 1;
+        goto cleanup;
+    }
+    PtyHandle pty_wr = pty_ctx.pipe_in;
+#else
+    pty_fd = pty_spawn(&child, term_cols, term_rows, shell_override,
+                       cell_width, cell_height);
     if (pty_fd < 0) {
         exit_code = 1;
         goto cleanup;
     }
+    PtyHandle pty_wr = pty_fd;
+#endif
 
     // Register effects so the terminal can respond to VT queries (device
     // attributes, mode reports, size queries, etc.) that programs like
     // vim, tmux, and htop send during startup.  Without these, query
     // sequences are silently dropped and those programs may hang or
     // fall back to degraded behavior.
+#ifdef _WIN32
+    EffectsContext effects_ctx = {
+        .pty_fd = pty_ctx.pipe_in,
+#else
     EffectsContext effects_ctx = {
         .pty_fd = pty_fd,
+#endif
         .cell_width = cell_width,
         .cell_height = cell_height,
         .cols = term_cols,
@@ -1165,7 +1602,7 @@ int main(void)
 
     // Set when the pty signals EOF/error — the child's side is closed.
     bool child_exited = false;
-    // Set once waitpid() successfully reaps the child.
+    // Set once the child process has been successfully reaped.
     bool child_reaped = false;
     int child_exit_status = -1;
 
@@ -1191,6 +1628,9 @@ int main(void)
                 // report the current geometry.
                 effects_ctx.cols = term_cols;
                 effects_ctx.rows = term_rows;
+#ifdef _WIN32
+                pty_resize(pty_ctx.hpc, term_cols, term_rows);
+#else
                 struct winsize new_ws = {
                     .ws_row = term_rows,
                     .ws_col = term_cols,
@@ -1198,6 +1638,7 @@ int main(void)
                     .ws_ypixel = (unsigned short)(term_rows * cell_height),
                 };
                 ioctl(pty_fd, TIOCSWINSZ, &new_ws);
+#endif
                 prev_width = w;
                 prev_height = h;
             }
@@ -1222,7 +1663,7 @@ int main(void)
                 GhosttyResult focus_res = ghostty_focus_encode(
                     focus_event, focus_buf, sizeof(focus_buf), &focus_written);
                 if (focus_res == GHOSTTY_SUCCESS && focus_written > 0)
-                    pty_write(pty_fd, focus_buf, focus_written);
+                    pty_write(pty_wr, focus_buf, focus_written);
             }
             prev_focused = focused;
         }
@@ -1230,7 +1671,11 @@ int main(void)
         // Drain any pending output from the shell and update terminal state.
         // Once the child has exited we stop reading — the fd may be closed.
         if (!child_exited) {
+#ifdef _WIN32
+            PtyReadResult pty_rc = pty_buf_drain(&pty_rb, terminal);
+#else
             PtyReadResult pty_rc = pty_read(pty_fd, terminal);
+#endif
             if (pty_rc != PTY_READ_OK) {
                 // EOF or error — the child's side of the pty is closed.
                 child_exited = true;
@@ -1242,6 +1687,19 @@ int main(void)
         // WNOHANG attempt right at EOF may miss.  We also check for
         // signal death so the banner can report it properly.
         if (child_exited && !child_reaped) {
+#ifdef _WIN32
+            DWORD wstatus = WaitForSingleObject(pty_ctx.process, 0);
+            if (wstatus == WAIT_OBJECT_0) {
+                child_reaped = true;
+                DWORD code = 0;
+                if (GetExitCodeProcess(pty_ctx.process, &code))
+                    child_exit_status = (int)code;
+            } else if (wstatus == WAIT_FAILED) {
+                // Handle is invalid — treat as reaped to avoid
+                // spinning every frame in an unrecoverable state.
+                child_reaped = true;
+            }
+#else
             int wstatus = 0;
             pid_t wp = waitpid(child, &wstatus, WNOHANG);
             if (wp > 0) {
@@ -1251,6 +1709,7 @@ int main(void)
                 else if (WIFSIGNALED(wstatus))
                     child_exit_status = 128 + WTERMSIG(wstatus);
             }
+#endif
         }
 
         // Handle scrollbar drag-to-scroll before mouse forwarding so
@@ -1261,9 +1720,9 @@ int main(void)
 
         // Forward keyboard/mouse input only while the child is alive.
         if (!child_exited) {
-            handle_input(pty_fd, key_encoder, key_event, terminal);
+            handle_input(pty_wr, key_encoder, key_event, terminal);
             if (!scrollbar_consumed)
-                handle_mouse(pty_fd, mouse_encoder, mouse_event, terminal,
+                handle_mouse(pty_wr, mouse_encoder, mouse_event, terminal,
                              cell_width, cell_height, pad);
         }
 
@@ -1319,6 +1778,26 @@ int main(void)
 cleanup:
     UnloadFont(mono_font);
     CloseWindow();
+#ifdef _WIN32
+    // Shutdown order matters:
+    // 1. Close the pseudo console — this tears down the ConPTY session
+    //    and breaks the output pipe, which unblocks the reader thread.
+    // 2. Wait for the reader thread to exit.
+    // 3. Clean up remaining handles (process, pipes).
+    if (pty_ctx.hpc != INVALID_HANDLE_VALUE) {
+        ClosePseudoConsole(pty_ctx.hpc);
+        pty_ctx.hpc = INVALID_HANDLE_VALUE;
+    }
+    if (pty_reader) {
+        if (WaitForSingleObject(pty_reader, 3000) != WAIT_OBJECT_0) {
+            fprintf(stderr, "pty reader thread did not exit in time, terminating\n");
+            TerminateThread(pty_reader, 1);
+        }
+        CloseHandle(pty_reader);
+    }
+    pty_cleanup(&pty_ctx);
+    DeleteCriticalSection(&pty_rb.cs);
+#else
     if (pty_fd >= 0)
         close(pty_fd);
     if (child > 0 && !child_reaped) {
@@ -1328,6 +1807,7 @@ cleanup:
             kill(child, SIGHUP);
         waitpid(child, NULL, 0);
     }
+#endif
     if (mouse_event)    ghostty_mouse_event_free(mouse_event);
     if (mouse_encoder)  ghostty_mouse_encoder_free(mouse_encoder);
     if (key_event)      ghostty_key_event_free(key_event);

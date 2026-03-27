@@ -4,8 +4,7 @@ Ghostling is a demo project meant to highlight a minimum
 functional terminal built on the libghostty C API in a
 [single C file](https://github.com/ghostty-org/ghostling/blob/main/main.c).
 
-The example uses Raylib for windowing and rendering. It is single-threaded
-(although libghostty-vt supports threading) and uses a 2D graphics renderer
+The example uses Raylib for windowing and rendering. It uses a 2D graphics renderer
 instead of a direct GPU renderer like the primary [Ghostty](https://ghostty.org) GUI. This is to
 showcase the flexibility of libghostty and how it can be used in a variety of
 contexts.
@@ -64,11 +63,6 @@ These features aren't properly exposed by libghostty-vt yet but will be:
 - OSC clipboard support
 - OSC title setting
 
-These are things that could work but haven't been tested or aren't
-implemented in Ghostling itself:
-
-- Windows support (libghostty-vt supports Windows)
-
 This list is incomplete and we'll add things as we find them.
 
 ### What You Won't Ever Get
@@ -113,8 +107,13 @@ Requirements:
 ```sh
 cmake -B build -G Ninja
 cmake --build build
-./build/ghostling
+./build/ghostling          # Linux / macOS
+.\build\ghostling.exe      # Windows
 ```
+
+On Windows, ghostling uses ConPTY and auto-detects the best available
+shell (pwsh > powershell > cmd). Pass a shell path as the first argument
+to override (e.g. `ghostling.exe C:\Windows\System32\cmd.exe`).
 
 > [!WARNING]
 >
