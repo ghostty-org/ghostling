@@ -47,7 +47,8 @@ features you _do get_:
 - Bold, italic, and inverse text styles
 - Unicode and multi-codepoint grapheme handling (no shaping or layout)
 - Keyboard input with modifier support (Shift, Ctrl, Alt, Super)
-- Kitty keyboard protocol support
+- Kitty keyboard protocol
+- Kitty graphics protocol
 - Mouse tracking (X10, normal, button, and any-event modes)
 - Mouse reporting formats (SGR, URxvt, UTF8, X10)
 - Scroll wheel support (viewport scrollback or forwarded to applications)
@@ -60,9 +61,7 @@ features you _do get_:
 
 These features aren't properly exposed by libghostty-vt yet but will be:
 
-- Kitty Graphics Protocol
 - OSC clipboard support
-- OSC title setting
 
 These are things that could work but haven't been tested or aren't
 implemented in Ghostling itself:
