@@ -627,123 +627,25 @@ static bool handle_scrollbar(GhosttyTerminal terminal,
     return *dragging;
 }
 
-// ---------------------------------------------------------------------------
-// Kitty graphics image cache
-// ---------------------------------------------------------------------------
+// Deferred texture cleanup — textures uploaded during a frame can't be
+// freed until after EndDrawing() flushes the draw commands to the GPU.
+#define MAX_DEFERRED_TEXTURES 256
+static Texture2D deferred_textures[MAX_DEFERRED_TEXTURES];
+static int deferred_texture_count = 0;
 
-// We cache Raylib Texture2D objects keyed by the Kitty image ID so we
-// don't re-upload pixel data to the GPU every frame.  The cache is a
-// simple linear array — terminal sessions rarely have more than a
-// handful of images alive at once, so O(n) lookups are fine.
-
-typedef struct {
-    uint32_t image_id;       // Kitty image ID (0 = unused slot)
-    Texture2D texture;       // Raylib texture (uploaded once, drawn many)
-    uint32_t src_width;      // Original image dimensions — used to detect
-    uint32_t src_height;     //   re-transmissions with a different payload
-} CachedImage;
-
-#define MAX_CACHED_IMAGES 128
-static CachedImage image_cache[MAX_CACHED_IMAGES];
-static int image_cache_count = 0;
-
-// Look up a cached texture by Kitty image ID.  Returns NULL if not found.
-static CachedImage *image_cache_find(uint32_t image_id)
+static void defer_unload_texture(Texture2D tex)
 {
-    for (int i = 0; i < image_cache_count; i++) {
-        if (image_cache[i].image_id == image_id)
-            return &image_cache[i];
-    }
-    return NULL;
+    if (deferred_texture_count < MAX_DEFERRED_TEXTURES)
+        deferred_textures[deferred_texture_count++] = tex;
+    else
+        UnloadTexture(tex); // overflow fallback — may glitch but won't leak
 }
 
-// Upload raw RGBA pixel data as a Raylib texture and store it in the
-// cache.  If the image ID already exists its old texture is replaced.
-// If the cache is full the request is silently ignored.
-static CachedImage *image_cache_put(uint32_t image_id,
-                                    const uint8_t *rgba_data,
-                                    uint32_t width, uint32_t height)
+static void flush_deferred_textures(void)
 {
-    // Build a Raylib Image wrapping the raw RGBA buffer.  Image doesn't
-    // own the pointer — LoadTextureFromImage copies it to the GPU
-    // immediately, so this is safe even though the source data is
-    // borrowed from the terminal.
-    Image img = {
-        .data    = (void *)(uintptr_t)rgba_data,
-        .width   = (int)width,
-        .height  = (int)height,
-        .mipmaps = 1,
-        .format  = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8,
-    };
-    Texture2D tex = LoadTextureFromImage(img);
-    SetTextureFilter(tex, TEXTURE_FILTER_BILINEAR);
-
-    // Replace an existing entry if the image was re-transmitted.
-    CachedImage *existing = image_cache_find(image_id);
-    if (existing) {
-        UnloadTexture(existing->texture);
-        existing->texture    = tex;
-        existing->src_width  = width;
-        existing->src_height = height;
-        return existing;
-    }
-
-    if (image_cache_count >= MAX_CACHED_IMAGES)
-        return NULL;
-
-    CachedImage *slot = &image_cache[image_cache_count++];
-    slot->image_id   = image_id;
-    slot->texture    = tex;
-    slot->src_width  = width;
-    slot->src_height = height;
-    return slot;
-}
-
-// Free all cached textures (called at shutdown).
-static void image_cache_clear(void)
-{
-    for (int i = 0; i < image_cache_count; i++)
-        UnloadTexture(image_cache[i].texture);
-    image_cache_count = 0;
-}
-
-// Ensure a Kitty image is in the cache, uploading it if needed.
-// Returns the cached entry or NULL on failure.
-static CachedImage *image_cache_ensure(GhosttyKittyGraphics graphics,
-                                       uint32_t image_id)
-{
-    GhosttyKittyGraphicsImage image = ghostty_kitty_graphics_image(graphics, image_id);
-    if (!image)
-        return NULL;
-
-    uint32_t img_w = 0, img_h = 0;
-    ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_IMAGE_DATA_WIDTH,  &img_w);
-    ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_IMAGE_DATA_HEIGHT, &img_h);
-    if (img_w == 0 || img_h == 0)
-        return NULL;
-
-    // If already cached with the same dimensions, reuse it.
-    CachedImage *cached = image_cache_find(image_id);
-    if (cached && cached->src_width == img_w && cached->src_height == img_h)
-        return cached;
-
-    // Need to upload.  The image data should be RGBA after the PNG
-    // decoder callback runs.  If it's in another format we skip it
-    // for simplicity — the PNG decoder we registered already converts
-    // everything to RGBA.
-    GhosttyKittyImageFormat fmt = GHOSTTY_KITTY_IMAGE_FORMAT_RGBA;
-    ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_IMAGE_DATA_FORMAT, &fmt);
-    if (fmt != GHOSTTY_KITTY_IMAGE_FORMAT_RGBA)
-        return NULL;
-
-    const uint8_t *data_ptr = NULL;
-    size_t data_len = 0;
-    ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_IMAGE_DATA_DATA_PTR, &data_ptr);
-    ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_IMAGE_DATA_DATA_LEN, &data_len);
-    if (!data_ptr || data_len < (size_t)img_w * img_h * 4)
-        return NULL;
-
-    return image_cache_put(image_id, data_ptr, img_w, img_h);
+    for (int i = 0; i < deferred_texture_count; i++)
+        UnloadTexture(deferred_textures[i]);
+    deferred_texture_count = 0;
 }
 
 // Draw all Kitty graphics placements for a given z-layer.
@@ -753,8 +655,11 @@ static CachedImage *image_cache_ensure(GhosttyKittyGraphics graphics,
 //    0 = below text       (INT32_MIN/2 <= z < 0)
 //    1 = above text       (z >= 0)
 //
-// The terminal and placement iterator must have been set up by the
-// caller.  The iterator is consumed (advanced to the end).
+// WARNING: This is deliberately simple but very inefficient.  Every
+// visible image is re-uploaded to the GPU every frame and destroyed
+// right after.  A real implementation should cache Texture2D objects
+// keyed by image ID and only re-upload when the image is re-transmitted
+// or evicted from the terminal's storage.
 static void render_kitty_images(GhosttyTerminal terminal,
                                 GhosttyKittyGraphics graphics,
                                 GhosttyKittyGraphicsPlacementIterator placement_iter,
@@ -788,9 +693,8 @@ static void render_kitty_images(GhosttyTerminal terminal,
     const int32_t bg_limit = INT32_MIN / 2;
 
     while (ghostty_kitty_graphics_placement_next(placement_iter)) {
-        // Check whether this placement is virtual (unicode placeholder).
-        // We skip virtual placements for now — they require scanning cells
-        // for placeholder characters, which is a more complex path.
+        // Skip virtual placements (unicode placeholders) — they require
+        // scanning cells for placeholder characters.
         bool is_virtual = false;
         ghostty_kitty_graphics_placement_get(placement_iter,
             GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_IS_VIRTUAL, &is_virtual);
@@ -802,28 +706,49 @@ static void render_kitty_images(GhosttyTerminal terminal,
         ghostty_kitty_graphics_placement_get(placement_iter,
             GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_Z, &z);
 
-        bool dominated = false;
+        bool skip = false;
         switch (z_layer) {
-        case -1: dominated = (z >= bg_limit);  break;  // below bg
-        case  0: dominated = (z < bg_limit || z >= 0); break;  // below text
-        case  1: dominated = (z < 0);          break;  // above text
-        default: dominated = true; break;
+        case -1: skip = (z >= bg_limit);          break;
+        case  0: skip = (z < bg_limit || z >= 0); break;
+        case  1: skip = (z < 0);                  break;
+        default: skip = true;                      break;
         }
-        if (dominated)
+        if (skip)
             continue;
 
-        // Get the image ID for this placement and ensure it's cached.
+        // Look up the image for this placement.
         uint32_t image_id = 0;
         ghostty_kitty_graphics_placement_get(placement_iter,
             GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_IMAGE_ID, &image_id);
 
-        CachedImage *cached = image_cache_ensure(graphics, image_id);
-        if (!cached)
-            continue;
-
         GhosttyKittyGraphicsImage image_handle =
             ghostty_kitty_graphics_image(graphics, image_id);
         if (!image_handle)
+            continue;
+
+        // Read image dimensions and pixel data.  We only handle RGBA
+        // (the PNG decoder we registered converts everything to RGBA).
+        uint32_t img_w = 0, img_h = 0;
+        ghostty_kitty_graphics_image_get(image_handle,
+            GHOSTTY_KITTY_IMAGE_DATA_WIDTH, &img_w);
+        ghostty_kitty_graphics_image_get(image_handle,
+            GHOSTTY_KITTY_IMAGE_DATA_HEIGHT, &img_h);
+        if (img_w == 0 || img_h == 0)
+            continue;
+
+        GhosttyKittyImageFormat fmt = GHOSTTY_KITTY_IMAGE_FORMAT_RGBA;
+        ghostty_kitty_graphics_image_get(image_handle,
+            GHOSTTY_KITTY_IMAGE_DATA_FORMAT, &fmt);
+        if (fmt != GHOSTTY_KITTY_IMAGE_FORMAT_RGBA)
+            continue;
+
+        const uint8_t *data_ptr = NULL;
+        size_t data_len = 0;
+        ghostty_kitty_graphics_image_get(image_handle,
+            GHOSTTY_KITTY_IMAGE_DATA_DATA_PTR, &data_ptr);
+        ghostty_kitty_graphics_image_get(image_handle,
+            GHOSTTY_KITTY_IMAGE_DATA_DATA_LEN, &data_len);
+        if (!data_ptr || data_len < (size_t)img_w * img_h * 4)
             continue;
 
         // Get the placement's bounding rectangle as grid refs (pins).
@@ -832,25 +757,19 @@ static void render_kitty_images(GhosttyTerminal terminal,
                 placement_iter, image_handle, terminal, &sel) != GHOSTTY_SUCCESS)
             continue;
 
-        // Convert the placement's top-left pin to screen coordinates,
-        // then compute viewport-relative position by subtracting the
-        // viewport origin.  Using screen coordinates (absolute row from
-        // top of scrollback) lets us handle placements whose top-left
-        // has scrolled above the viewport — they'll get a negative Y
-        // which correctly draws the visible bottom portion.
+        // Convert the placement's top-left to screen coordinates, then
+        // subtract the viewport origin to get viewport-relative position.
+        // A negative Y means the top of the image is above the viewport.
         GhosttyPointCoordinate img_screen = {0};
         if (ghostty_terminal_point_from_grid_ref(
                 terminal, &sel.start, GHOSTTY_POINT_TAG_SCREEN,
                 &img_screen) != GHOSTTY_SUCCESS)
             continue;
 
-        // Viewport-relative row (signed — negative means the top of
-        // the image is above the visible area).
         int32_t vp_row = (int32_t)img_screen.y - (int32_t)vp_screen.y;
         int32_t vp_col = (int32_t)img_screen.x;
 
-        // Compute the rendered size from the grid cell count so the
-        // result is in logical (screen-space) pixels.
+        // Compute grid cell count for rendered size.
         uint32_t grid_cols = 0, grid_rows = 0;
         if (ghostty_kitty_graphics_placement_grid_size(
                 placement_iter, image_handle, terminal,
@@ -859,7 +778,7 @@ static void render_kitty_images(GhosttyTerminal terminal,
         if (grid_cols == 0 || grid_rows == 0)
             continue;
 
-        // Skip placements that are entirely outside the viewport.
+        // Skip placements entirely outside the viewport.
         if (vp_row + (int32_t)grid_rows <= 0 || vp_row >= (int32_t)term_rows)
             continue;
 
@@ -878,14 +797,14 @@ static void render_kitty_images(GhosttyTerminal terminal,
             GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_SOURCE_HEIGHT, &src_h);
 
         // 0 means "full image dimension" per the Kitty protocol.
-        if (src_w == 0) src_w = cached->src_width;
-        if (src_h == 0) src_h = cached->src_height;
+        if (src_w == 0) src_w = img_w;
+        if (src_h == 0) src_h = img_h;
 
         // Clamp source rect to the actual image bounds.
-        if (src_x > cached->src_width)  src_x = cached->src_width;
-        if (src_y > cached->src_height) src_y = cached->src_height;
-        if (src_x + src_w > cached->src_width)  src_w = cached->src_width  - src_x;
-        if (src_y + src_h > cached->src_height) src_h = cached->src_height - src_y;
+        if (src_x > img_w) src_x = img_w;
+        if (src_y > img_h) src_y = img_h;
+        if (src_x + src_w > img_w) src_w = img_w - src_x;
+        if (src_y + src_h > img_h) src_h = img_h - src_y;
 
         // Read the sub-cell pixel offsets.
         uint32_t x_offset = 0, y_offset = 0;
@@ -894,12 +813,20 @@ static void render_kitty_images(GhosttyTerminal terminal,
         ghostty_kitty_graphics_placement_get(placement_iter,
             GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_Y_OFFSET, &y_offset);
 
-        // Convert viewport-relative grid position to screen pixels.
+        // Upload the RGBA data to a temporary texture, draw, and free.
+        Image img = {
+            .data    = (void *)(uintptr_t)data_ptr,
+            .width   = (int)img_w,
+            .height  = (int)img_h,
+            .mipmaps = 1,
+            .format  = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8,
+        };
+        Texture2D tex = LoadTextureFromImage(img);
+        SetTextureFilter(tex, TEXTURE_FILTER_BILINEAR);
+
         int dest_x = pad + (int)vp_col * cell_width  + (int)x_offset;
         int dest_y = pad + (int)vp_row * cell_height + (int)y_offset;
 
-        // Draw the image using Raylib's DrawTexturePro, which handles
-        // source-rect → dest-rect mapping with bilinear filtering.
         Rectangle src_rect = {
             (float)src_x, (float)src_y,
             (float)src_w, (float)src_h
@@ -908,24 +835,10 @@ static void render_kitty_images(GhosttyTerminal terminal,
             (float)dest_x, (float)dest_y,
             (float)dest_w, (float)dest_h
         };
-        DrawTexturePro(cached->texture, src_rect, dst_rect,
+        DrawTexturePro(tex, src_rect, dst_rect,
                        (Vector2){0, 0}, 0.0f, WHITE);
-    }
-}
 
-// Evict cached textures for images that no longer exist in the
-// terminal's Kitty graphics storage.
-static void image_cache_gc(GhosttyKittyGraphics graphics)
-{
-    for (int i = 0; i < image_cache_count; ) {
-        GhosttyKittyGraphicsImage img =
-            ghostty_kitty_graphics_image(graphics, image_cache[i].image_id);
-        if (!img) {
-            UnloadTexture(image_cache[i].texture);
-            image_cache[i] = image_cache[--image_cache_count];
-        } else {
-            i++;
-        }
+        defer_unload_texture(tex);
     }
 }
 
@@ -971,10 +884,6 @@ static void render_terminal(GhosttyRenderState render_state,
     bool has_kitty = (ghostty_terminal_get(terminal,
         GHOSTTY_TERMINAL_DATA_KITTY_GRAPHICS, &kitty_gfx) == GHOSTTY_SUCCESS
         && kitty_gfx != NULL);
-
-    // Garbage-collect cached textures for images the terminal has deleted.
-    if (has_kitty)
-        image_cache_gc(kitty_gfx);
 
     // Populate the row iterator from the current render state snapshot.
     if (ghostty_render_state_get(render_state,
@@ -1730,10 +1639,14 @@ int main(void)
         }
 
         EndDrawing();
+
+        // Free any textures that were uploaded during this frame's
+        // kitty image rendering.  Safe now that EndDrawing() has
+        // flushed all draw commands to the GPU.
+        flush_deferred_textures();
     }
 
 cleanup:
-    image_cache_clear();
     UnloadFont(mono_font);
     CloseWindow();
     if (pty_fd >= 0)
