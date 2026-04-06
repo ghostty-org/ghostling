@@ -628,6 +628,308 @@ static bool handle_scrollbar(GhosttyTerminal terminal,
 }
 
 // ---------------------------------------------------------------------------
+// Kitty graphics image cache
+// ---------------------------------------------------------------------------
+
+// We cache Raylib Texture2D objects keyed by the Kitty image ID so we
+// don't re-upload pixel data to the GPU every frame.  The cache is a
+// simple linear array — terminal sessions rarely have more than a
+// handful of images alive at once, so O(n) lookups are fine.
+
+typedef struct {
+    uint32_t image_id;       // Kitty image ID (0 = unused slot)
+    Texture2D texture;       // Raylib texture (uploaded once, drawn many)
+    uint32_t src_width;      // Original image dimensions — used to detect
+    uint32_t src_height;     //   re-transmissions with a different payload
+} CachedImage;
+
+#define MAX_CACHED_IMAGES 128
+static CachedImage image_cache[MAX_CACHED_IMAGES];
+static int image_cache_count = 0;
+
+// Look up a cached texture by Kitty image ID.  Returns NULL if not found.
+static CachedImage *image_cache_find(uint32_t image_id)
+{
+    for (int i = 0; i < image_cache_count; i++) {
+        if (image_cache[i].image_id == image_id)
+            return &image_cache[i];
+    }
+    return NULL;
+}
+
+// Upload raw RGBA pixel data as a Raylib texture and store it in the
+// cache.  If the image ID already exists its old texture is replaced.
+// If the cache is full the request is silently ignored.
+static CachedImage *image_cache_put(uint32_t image_id,
+                                    const uint8_t *rgba_data,
+                                    uint32_t width, uint32_t height)
+{
+    // Build a Raylib Image wrapping the raw RGBA buffer.  Image doesn't
+    // own the pointer — LoadTextureFromImage copies it to the GPU
+    // immediately, so this is safe even though the source data is
+    // borrowed from the terminal.
+    Image img = {
+        .data    = (void *)(uintptr_t)rgba_data,
+        .width   = (int)width,
+        .height  = (int)height,
+        .mipmaps = 1,
+        .format  = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8,
+    };
+    Texture2D tex = LoadTextureFromImage(img);
+    SetTextureFilter(tex, TEXTURE_FILTER_BILINEAR);
+
+    // Replace an existing entry if the image was re-transmitted.
+    CachedImage *existing = image_cache_find(image_id);
+    if (existing) {
+        UnloadTexture(existing->texture);
+        existing->texture    = tex;
+        existing->src_width  = width;
+        existing->src_height = height;
+        return existing;
+    }
+
+    if (image_cache_count >= MAX_CACHED_IMAGES)
+        return NULL;
+
+    CachedImage *slot = &image_cache[image_cache_count++];
+    slot->image_id   = image_id;
+    slot->texture    = tex;
+    slot->src_width  = width;
+    slot->src_height = height;
+    return slot;
+}
+
+// Free all cached textures (called at shutdown).
+static void image_cache_clear(void)
+{
+    for (int i = 0; i < image_cache_count; i++)
+        UnloadTexture(image_cache[i].texture);
+    image_cache_count = 0;
+}
+
+// Ensure a Kitty image is in the cache, uploading it if needed.
+// Returns the cached entry or NULL on failure.
+static CachedImage *image_cache_ensure(GhosttyKittyGraphics graphics,
+                                       uint32_t image_id)
+{
+    GhosttyKittyGraphicsImage image = ghostty_kitty_graphics_image(graphics, image_id);
+    if (!image)
+        return NULL;
+
+    uint32_t img_w = 0, img_h = 0;
+    ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_IMAGE_DATA_WIDTH,  &img_w);
+    ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_IMAGE_DATA_HEIGHT, &img_h);
+    if (img_w == 0 || img_h == 0)
+        return NULL;
+
+    // If already cached with the same dimensions, reuse it.
+    CachedImage *cached = image_cache_find(image_id);
+    if (cached && cached->src_width == img_w && cached->src_height == img_h)
+        return cached;
+
+    // Need to upload.  The image data should be RGBA after the PNG
+    // decoder callback runs.  If it's in another format we skip it
+    // for simplicity — the PNG decoder we registered already converts
+    // everything to RGBA.
+    GhosttyKittyImageFormat fmt = GHOSTTY_KITTY_IMAGE_FORMAT_RGBA;
+    ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_IMAGE_DATA_FORMAT, &fmt);
+    if (fmt != GHOSTTY_KITTY_IMAGE_FORMAT_RGBA)
+        return NULL;
+
+    const uint8_t *data_ptr = NULL;
+    size_t data_len = 0;
+    ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_IMAGE_DATA_DATA_PTR, &data_ptr);
+    ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_IMAGE_DATA_DATA_LEN, &data_len);
+    if (!data_ptr || data_len < (size_t)img_w * img_h * 4)
+        return NULL;
+
+    return image_cache_put(image_id, data_ptr, img_w, img_h);
+}
+
+// Draw all Kitty graphics placements for a given z-layer.
+//
+// z_layer selects which placements to draw:
+//   -1 = below background (z < INT32_MIN/2)
+//    0 = below text       (INT32_MIN/2 <= z < 0)
+//    1 = above text       (z >= 0)
+//
+// The terminal and placement iterator must have been set up by the
+// caller.  The iterator is consumed (advanced to the end).
+static void render_kitty_images(GhosttyTerminal terminal,
+                                GhosttyKittyGraphics graphics,
+                                GhosttyKittyGraphicsPlacementIterator placement_iter,
+                                int cell_width, int cell_height, int pad,
+                                int z_layer, uint16_t term_rows)
+{
+    // Re-populate the iterator for each layer so we can scan all
+    // placements independently.
+    if (ghostty_kitty_graphics_get(graphics,
+            GHOSTTY_KITTY_GRAPHICS_DATA_PLACEMENT_ITERATOR,
+            &placement_iter) != GHOSTTY_SUCCESS)
+        return;
+
+    // Get the viewport's top-left in screen coordinates so we can
+    // compute viewport-relative positions for each placement.  Screen
+    // coordinates are absolute (row 0 = top of scrollback) so they
+    // work regardless of which page node a pin lives in.
+    GhosttyGridRef vp_origin_ref = GHOSTTY_INIT_SIZED(GhosttyGridRef);
+    GhosttyPoint vp_origin_pt = {
+        .tag = GHOSTTY_POINT_TAG_VIEWPORT,
+        .value = { .coordinate = { .x = 0, .y = 0 } },
+    };
+    if (ghostty_terminal_grid_ref(terminal, vp_origin_pt,
+            &vp_origin_ref) != GHOSTTY_SUCCESS)
+        return;
+    GhosttyPointCoordinate vp_screen = {0};
+    if (ghostty_terminal_point_from_grid_ref(terminal, &vp_origin_ref,
+            GHOSTTY_POINT_TAG_SCREEN, &vp_screen) != GHOSTTY_SUCCESS)
+        return;
+
+    const int32_t bg_limit = INT32_MIN / 2;
+
+    while (ghostty_kitty_graphics_placement_next(placement_iter)) {
+        // Check whether this placement is virtual (unicode placeholder).
+        // We skip virtual placements for now — they require scanning cells
+        // for placeholder characters, which is a more complex path.
+        bool is_virtual = false;
+        ghostty_kitty_graphics_placement_get(placement_iter,
+            GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_IS_VIRTUAL, &is_virtual);
+        if (is_virtual)
+            continue;
+
+        // Read the z-index and filter by the requested layer.
+        int32_t z = 0;
+        ghostty_kitty_graphics_placement_get(placement_iter,
+            GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_Z, &z);
+
+        bool dominated = false;
+        switch (z_layer) {
+        case -1: dominated = (z >= bg_limit);  break;  // below bg
+        case  0: dominated = (z < bg_limit || z >= 0); break;  // below text
+        case  1: dominated = (z < 0);          break;  // above text
+        default: dominated = true; break;
+        }
+        if (dominated)
+            continue;
+
+        // Get the image ID for this placement and ensure it's cached.
+        uint32_t image_id = 0;
+        ghostty_kitty_graphics_placement_get(placement_iter,
+            GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_IMAGE_ID, &image_id);
+
+        CachedImage *cached = image_cache_ensure(graphics, image_id);
+        if (!cached)
+            continue;
+
+        GhosttyKittyGraphicsImage image_handle =
+            ghostty_kitty_graphics_image(graphics, image_id);
+        if (!image_handle)
+            continue;
+
+        // Get the placement's bounding rectangle as grid refs (pins).
+        GhosttySelection sel = GHOSTTY_INIT_SIZED(GhosttySelection);
+        if (ghostty_kitty_graphics_placement_rect(
+                placement_iter, image_handle, terminal, &sel) != GHOSTTY_SUCCESS)
+            continue;
+
+        // Convert the placement's top-left pin to screen coordinates,
+        // then compute viewport-relative position by subtracting the
+        // viewport origin.  Using screen coordinates (absolute row from
+        // top of scrollback) lets us handle placements whose top-left
+        // has scrolled above the viewport — they'll get a negative Y
+        // which correctly draws the visible bottom portion.
+        GhosttyPointCoordinate img_screen = {0};
+        if (ghostty_terminal_point_from_grid_ref(
+                terminal, &sel.start, GHOSTTY_POINT_TAG_SCREEN,
+                &img_screen) != GHOSTTY_SUCCESS)
+            continue;
+
+        // Viewport-relative row (signed — negative means the top of
+        // the image is above the visible area).
+        int32_t vp_row = (int32_t)img_screen.y - (int32_t)vp_screen.y;
+        int32_t vp_col = (int32_t)img_screen.x;
+
+        // Compute the rendered size from the grid cell count so the
+        // result is in logical (screen-space) pixels.
+        uint32_t grid_cols = 0, grid_rows = 0;
+        if (ghostty_kitty_graphics_placement_grid_size(
+                placement_iter, image_handle, terminal,
+                &grid_cols, &grid_rows) != GHOSTTY_SUCCESS)
+            continue;
+        if (grid_cols == 0 || grid_rows == 0)
+            continue;
+
+        // Skip placements that are entirely outside the viewport.
+        if (vp_row + (int32_t)grid_rows <= 0 || vp_row >= (int32_t)term_rows)
+            continue;
+
+        uint32_t dest_w = grid_cols * (uint32_t)cell_width;
+        uint32_t dest_h = grid_rows * (uint32_t)cell_height;
+
+        // Read the source rectangle from the placement.
+        uint32_t src_x = 0, src_y = 0, src_w = 0, src_h = 0;
+        ghostty_kitty_graphics_placement_get(placement_iter,
+            GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_SOURCE_X, &src_x);
+        ghostty_kitty_graphics_placement_get(placement_iter,
+            GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_SOURCE_Y, &src_y);
+        ghostty_kitty_graphics_placement_get(placement_iter,
+            GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_SOURCE_WIDTH, &src_w);
+        ghostty_kitty_graphics_placement_get(placement_iter,
+            GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_SOURCE_HEIGHT, &src_h);
+
+        // 0 means "full image dimension" per the Kitty protocol.
+        if (src_w == 0) src_w = cached->src_width;
+        if (src_h == 0) src_h = cached->src_height;
+
+        // Clamp source rect to the actual image bounds.
+        if (src_x > cached->src_width)  src_x = cached->src_width;
+        if (src_y > cached->src_height) src_y = cached->src_height;
+        if (src_x + src_w > cached->src_width)  src_w = cached->src_width  - src_x;
+        if (src_y + src_h > cached->src_height) src_h = cached->src_height - src_y;
+
+        // Read the sub-cell pixel offsets.
+        uint32_t x_offset = 0, y_offset = 0;
+        ghostty_kitty_graphics_placement_get(placement_iter,
+            GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_X_OFFSET, &x_offset);
+        ghostty_kitty_graphics_placement_get(placement_iter,
+            GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_Y_OFFSET, &y_offset);
+
+        // Convert viewport-relative grid position to screen pixels.
+        int dest_x = pad + (int)vp_col * cell_width  + (int)x_offset;
+        int dest_y = pad + (int)vp_row * cell_height + (int)y_offset;
+
+        // Draw the image using Raylib's DrawTexturePro, which handles
+        // source-rect → dest-rect mapping with bilinear filtering.
+        Rectangle src_rect = {
+            (float)src_x, (float)src_y,
+            (float)src_w, (float)src_h
+        };
+        Rectangle dst_rect = {
+            (float)dest_x, (float)dest_y,
+            (float)dest_w, (float)dest_h
+        };
+        DrawTexturePro(cached->texture, src_rect, dst_rect,
+                       (Vector2){0, 0}, 0.0f, WHITE);
+    }
+}
+
+// Evict cached textures for images that no longer exist in the
+// terminal's Kitty graphics storage.
+static void image_cache_gc(GhosttyKittyGraphics graphics)
+{
+    for (int i = 0; i < image_cache_count; ) {
+        GhosttyKittyGraphicsImage img =
+            ghostty_kitty_graphics_image(graphics, image_cache[i].image_id);
+        if (!img) {
+            UnloadTexture(image_cache[i].texture);
+            image_cache[i] = image_cache[--image_cache_count];
+        } else {
+            i++;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Rendering
 // ---------------------------------------------------------------------------
 
@@ -652,7 +954,10 @@ static void render_terminal(GhosttyRenderState render_state,
                             int cell_width, int cell_height,
                             int font_size,
                             int pad,
-                            const GhosttyTerminalScrollbar *scrollbar)
+                            const GhosttyTerminalScrollbar *scrollbar,
+                            GhosttyTerminal terminal,
+                            GhosttyKittyGraphicsPlacementIterator placement_iter,
+                            uint16_t term_rows)
 {
     // Grab colors (palette, default fg/bg) from the render state so we
     // can resolve palette-indexed cell colors.
@@ -660,10 +965,28 @@ static void render_terminal(GhosttyRenderState render_state,
     if (ghostty_render_state_colors_get(render_state, &colors) != GHOSTTY_SUCCESS)
         return;
 
+    // Obtain the Kitty graphics storage from the terminal.  This is a
+    // borrowed pointer valid until the next mutating terminal call.
+    GhosttyKittyGraphics kitty_gfx = NULL;
+    bool has_kitty = (ghostty_terminal_get(terminal,
+        GHOSTTY_TERMINAL_DATA_KITTY_GRAPHICS, &kitty_gfx) == GHOSTTY_SUCCESS
+        && kitty_gfx != NULL);
+
+    // Garbage-collect cached textures for images the terminal has deleted.
+    if (has_kitty)
+        image_cache_gc(kitty_gfx);
+
     // Populate the row iterator from the current render state snapshot.
     if (ghostty_render_state_get(render_state,
             GHOSTTY_RENDER_STATE_DATA_ROW_ITERATOR, &row_iter) != GHOSTTY_SUCCESS)
         return;
+
+    // --- Layer 1: images below cell backgrounds (z < INT32_MIN/2) ---
+    if (has_kitty && placement_iter) {
+        render_kitty_images(terminal, kitty_gfx, placement_iter,
+                            cell_width, cell_height, pad, /*z_layer=*/-1,
+                            term_rows);
+    }
 
     // Small padding from the window edges.
     int y = pad;
@@ -775,6 +1098,17 @@ static void render_terminal(GhosttyRenderState render_state,
         y += cell_height;
     }
 
+    // --- Layer 2: images below text (INT32_MIN/2 <= z < 0) ---
+    // Drawn after cell backgrounds but before the cursor and any
+    // above-text images.  In our single-pass renderer the cell text
+    // has already been drawn, but this still achieves the correct
+    // visual for the common case where images sit behind text.
+    if (has_kitty && placement_iter) {
+        render_kitty_images(terminal, kitty_gfx, placement_iter,
+                            cell_width, cell_height, pad, /*z_layer=*/0,
+                            term_rows);
+    }
+
     // Draw the cursor.
     bool cursor_visible = false;
     ghostty_render_state_get(render_state,
@@ -798,6 +1132,13 @@ static void render_terminal(GhosttyRenderState render_state,
         int cur_x = pad + cx * cell_width;
         int cur_y = pad + cy * cell_height;
         DrawRectangle(cur_x, cur_y, cell_width, cell_height, (Color){ cur_rgb.r, cur_rgb.g, cur_rgb.b, 128 });
+    }
+
+    // --- Layer 3: images above text (z >= 0) ---
+    if (has_kitty && placement_iter) {
+        render_kitty_images(terminal, kitty_gfx, placement_iter,
+                            cell_width, cell_height, pad, /*z_layer=*/1,
+                            term_rows);
     }
 
     // Draw the scrollbar when there is scrollback content to scroll through.
@@ -1079,6 +1420,7 @@ int main(void)
     GhosttyRenderState render_state = NULL;
     GhosttyRenderStateRowIterator row_iter = NULL;
     GhosttyRenderStateRowCells row_cells = NULL;
+    GhosttyKittyGraphicsPlacementIterator placement_iter = NULL;
     int exit_code = 0;
 
     // Install the PNG decoder via the sys interface so the terminal can
@@ -1097,6 +1439,12 @@ int main(void)
         exit_code = 1;
         goto cleanup;
     }
+
+    // The terminal options don't include cell pixel dimensions, so
+    // issue an initial resize to set them.  Without this, Kitty
+    // graphics placement_rect would divide by zero cell sizes.
+    ghostty_terminal_resize(terminal, term_cols, term_rows,
+                            (uint32_t)cell_width, (uint32_t)cell_height);
 
     // Spawn a child shell connected to a pseudo-terminal.  The master fd
     // is what we read/write; the child's stdin/stdout/stderr are wired to
@@ -1206,6 +1554,13 @@ int main(void)
     err = ghostty_render_state_row_cells_new(NULL, &row_cells);
     if (err != GHOSTTY_SUCCESS) {
         fprintf(stderr, "ghostty_render_state_row_cells_new failed (%d)\n", err);
+        exit_code = 1;
+        goto cleanup;
+    }
+
+    err = ghostty_kitty_graphics_placement_iterator_new(NULL, &placement_iter);
+    if (err != GHOSTTY_SUCCESS) {
+        fprintf(stderr, "ghostty_kitty_graphics_placement_iterator_new failed (%d)\n", err);
         exit_code = 1;
         goto cleanup;
     }
@@ -1349,7 +1704,8 @@ int main(void)
         ClearBackground(win_bg);
         render_terminal(render_state, row_iter, row_cells, mono_font,
                         cell_width, cell_height, font_size, pad,
-                        scrollbar_ptr);
+                        scrollbar_ptr, terminal, placement_iter,
+                        term_rows);
 
         // Show a banner when the child process has exited so the user
         // knows the shell is gone (they can still scroll / inspect output).
@@ -1377,6 +1733,7 @@ int main(void)
     }
 
 cleanup:
+    image_cache_clear();
     UnloadFont(mono_font);
     CloseWindow();
     if (pty_fd >= 0)
@@ -1388,6 +1745,7 @@ cleanup:
             kill(child, SIGHUP);
         waitpid(child, NULL, 0);
     }
+    if (placement_iter) ghostty_kitty_graphics_placement_iterator_free(placement_iter);
     if (mouse_event)    ghostty_mouse_event_free(mouse_event);
     if (mouse_encoder)  ghostty_mouse_encoder_free(mouse_encoder);
     if (key_event)      ghostty_key_event_free(key_event);
