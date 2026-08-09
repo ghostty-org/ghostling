@@ -301,6 +301,339 @@ static GhosttyMouseButton raylib_mouse_to_ghostty(int rl_button)
     }
 }
 
+typedef enum {
+    SELECTION_DRAG_NONE,
+    SELECTION_DRAG_CHAR,
+    SELECTION_DRAG_WORD,
+    SELECTION_DRAG_LINE,
+} SelectionDragKind;
+
+typedef struct {
+    // A mouse drag selection needs an anchor that survives terminal
+    // mutations.  The libghostty selection setters copy snapshots into
+    // terminal-owned tracked state, but our drag anchor is application state,
+    // so keep it as a tracked grid ref and snapshot it only when rebuilding
+    // the active selection.
+    GhosttyTrackedGridRef anchor;
+    SelectionDragKind kind;
+    bool active;
+    bool moved;
+    int click_count;
+    double last_click_time;
+    double click_origin_x;
+    double click_origin_y;
+} SelectionState;
+
+// Drop any in-progress selection drag anchor.  The anchor is a tracked
+// libghostty object owned by Ghostling, so every path that ends or abandons a
+// drag must release it explicitly instead of relying on terminal selection
+// ownership.
+static void selection_state_clear_anchor(SelectionState *state)
+{
+    if (state->anchor) {
+        ghostty_tracked_grid_ref_free(state->anchor);
+        state->anchor = NULL;
+    }
+    state->active = false;
+    state->moved = false;
+    state->kind = SELECTION_DRAG_NONE;
+}
+
+// Match Ghostty's rectangular-selection modifier convention so Ghostling feels
+// the same across platforms: Option alone on macOS, Ctrl/Super+Alt elsewhere.
+static bool selection_rectangle_mods(GhosttyMods mods)
+{
+#if defined(__APPLE__)
+    return (mods & GHOSTTY_MODS_ALT) != 0;
+#else
+    return (mods & GHOSTTY_MODS_ALT) != 0
+        && (mods & (GHOSTTY_MODS_CTRL | GHOSTTY_MODS_SUPER)) != 0;
+#endif
+}
+
+// Decide whether a mouse gesture should manipulate terminal selection or be
+// forwarded to the running application.  Applications that request mouse
+// tracking get normal events, but Shift provides the common terminal-emulator
+// escape hatch for selecting text anyway.
+static bool selection_allowed_with_mods(GhosttyTerminal terminal,
+                                        GhosttyMods mods)
+{
+    bool mouse_tracking = false;
+    ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_MOUSE_TRACKING, &mouse_tracking);
+
+    // When an application has enabled mouse tracking, normal mouse events
+    // belong to the application.  Holding Shift overrides that so users can
+    // still select text in full-screen apps such as vim and tmux.
+    return !mouse_tracking || (mods & GHOSTTY_MODS_SHIFT) != 0;
+}
+
+// Test the real terminal grid bounds rather than using the window dimensions:
+// padding and any partially visible trailing pixels are not selectable cells,
+// and the I-beam cursor should not appear there.
+static bool mouse_in_terminal_grid(GhosttyTerminal terminal,
+                                   int cell_width, int cell_height,
+                                   int pad)
+{
+    uint16_t cols = 1;
+    uint16_t rows = 1;
+    ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_COLS, &cols);
+    ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_ROWS, &rows);
+
+    Vector2 pos = GetMousePosition();
+    float left = (float)pad;
+    float top = (float)pad;
+    float right = left + (float)cols * (float)cell_width;
+    float bottom = top + (float)rows * (float)cell_height;
+    return pos.x >= left && pos.x < right && pos.y >= top && pos.y < bottom;
+}
+
+// Convert the current mouse position to a clamped viewport grid point.
+// Clamping lets users start or continue a drag slightly outside the padded
+// terminal area while still extending to the nearest visible cell.
+static GhosttyPoint mouse_viewport_point(GhosttyTerminal terminal,
+                                         int cell_width, int cell_height,
+                                         int pad)
+{
+    uint16_t cols = 1;
+    uint16_t rows = 1;
+    ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_COLS, &cols);
+    ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_ROWS, &rows);
+
+    Vector2 pos = GetMousePosition();
+    int x = 0;
+    int y = 0;
+
+    if (pos.x > (float)pad)
+        x = (int)((pos.x - (float)pad) / (float)cell_width);
+    if (pos.y > (float)pad)
+        y = (int)((pos.y - (float)pad) / (float)cell_height);
+
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    if (x >= (int)cols) x = (int)cols - 1;
+    if (y >= (int)rows) y = (int)rows - 1;
+
+    return (GhosttyPoint){
+        .tag = GHOSTTY_POINT_TAG_VIEWPORT,
+        .value = { .coordinate = { .x = (uint16_t)x, .y = (uint32_t)y } },
+    };
+}
+
+// Resolve the mouse's viewport cell to a libghostty grid reference.  Most
+// selection APIs operate on grid refs rather than raw coordinates so they can
+// preserve scrollback/page-list identity.
+static bool terminal_ref_at_mouse(GhosttyTerminal terminal,
+                                  int cell_width, int cell_height, int pad,
+                                  GhosttyGridRef *out_ref)
+{
+    GhosttyPoint point = mouse_viewport_point(terminal, cell_width, cell_height, pad);
+    *out_ref = GHOSTTY_INIT_SIZED(GhosttyGridRef);
+    return ghostty_terminal_grid_ref(terminal, point, out_ref) == GHOSTTY_SUCCESS;
+}
+
+// Start a drag selection by storing a tracked grid reference at the mouse.
+// Selection snapshots are invalidated by terminal mutations, but drag anchors
+// need to survive output arriving from the pty between frames.
+static bool selection_set_anchor_at_mouse(SelectionState *state,
+                                          GhosttyTerminal terminal,
+                                          int cell_width, int cell_height,
+                                          int pad)
+{
+    selection_state_clear_anchor(state);
+
+    GhosttyPoint point = mouse_viewport_point(terminal, cell_width, cell_height, pad);
+    GhosttyTrackedGridRef anchor = NULL;
+    if (ghostty_terminal_grid_ref_track(terminal, point, &anchor) != GHOSTTY_SUCCESS)
+        return false;
+
+    state->anchor = anchor;
+    state->active = true;
+    state->moved = false;
+    return true;
+}
+
+// Convert the long-lived drag anchor back into a short-lived snapshot right
+// before rebuilding a GhosttySelection.  This keeps us inside libghostty's
+// untracked grid-ref lifetime rules.
+static bool selection_anchor_snapshot(SelectionState *state,
+                                      GhosttyGridRef *out_ref)
+{
+    if (!state->anchor)
+        return false;
+    *out_ref = GHOSTTY_INIT_SIZED(GhosttyGridRef);
+    return ghostty_tracked_grid_ref_snapshot(state->anchor, out_ref) == GHOSTTY_SUCCESS;
+}
+
+// Install a freshly-created selection into the terminal.  libghostty copies the
+// snapshot into terminal-owned tracked state, so the stack selection can die as
+// soon as this call returns.
+static void selection_install(GhosttyTerminal terminal,
+                              const GhosttySelection *selection)
+{
+    ghostty_terminal_set(terminal, GHOSTTY_TERMINAL_OPT_SELECTION, selection);
+}
+
+// Clear the terminal-owned active selection.  Single-click starts with a clear
+// so an old selection does not linger while the user begins a new drag.
+static void selection_clear_terminal(GhosttyTerminal terminal)
+{
+    ghostty_terminal_set(terminal, GHOSTTY_TERMINAL_OPT_SELECTION, NULL);
+}
+
+// Rebuild a character-wise drag selection from the tracked anchor to the
+// current mouse cell.  The endpoints are intentionally inclusive; libghostty is
+// responsible for ordering, rectangular semantics, and render-state metadata.
+static void selection_update_char_drag(SelectionState *state,
+                                       GhosttyTerminal terminal,
+                                       int cell_width, int cell_height,
+                                       int pad,
+                                       GhosttyMods mods)
+{
+    GhosttyGridRef start = GHOSTTY_INIT_SIZED(GhosttyGridRef);
+    GhosttyGridRef end = GHOSTTY_INIT_SIZED(GhosttyGridRef);
+    if (!selection_anchor_snapshot(state, &start)
+        || !terminal_ref_at_mouse(terminal, cell_width, cell_height, pad, &end))
+        return;
+
+    GhosttySelection selection = GHOSTTY_INIT_SIZED(GhosttySelection);
+    selection.start = start;
+    selection.end = end;
+    selection.rectangle = selection_rectangle_mods(mods);
+    selection_install(terminal, &selection);
+}
+
+// Rebuild a double-click drag as a word selection.  Asking libghostty for the
+// nearest word in both directions avoids flicker when the pointer moves across
+// spaces or punctuation between words.
+static void selection_update_word_drag(SelectionState *state,
+                                       GhosttyTerminal terminal,
+                                       int cell_width, int cell_height,
+                                       int pad)
+{
+    GhosttyGridRef anchor = GHOSTTY_INIT_SIZED(GhosttyGridRef);
+    GhosttyGridRef drag = GHOSTTY_INIT_SIZED(GhosttyGridRef);
+    if (!selection_anchor_snapshot(state, &anchor)
+        || !terminal_ref_at_mouse(terminal, cell_width, cell_height, pad, &drag))
+        return;
+
+    GhosttyTerminalSelectWordBetweenOptions start_opts =
+        GHOSTTY_INIT_SIZED(GhosttyTerminalSelectWordBetweenOptions);
+    start_opts.start = anchor;
+    start_opts.end = drag;
+
+    GhosttySelection start_word = GHOSTTY_INIT_SIZED(GhosttySelection);
+    if (ghostty_terminal_select_word_between(terminal, &start_opts, &start_word) != GHOSTTY_SUCCESS)
+        return;
+
+    GhosttyTerminalSelectWordBetweenOptions end_opts =
+        GHOSTTY_INIT_SIZED(GhosttyTerminalSelectWordBetweenOptions);
+    end_opts.start = drag;
+    end_opts.end = anchor;
+
+    GhosttySelection end_word = GHOSTTY_INIT_SIZED(GhosttySelection);
+    if (ghostty_terminal_select_word_between(terminal, &end_opts, &end_word) != GHOSTTY_SUCCESS)
+        return;
+
+    GhosttySelection selection = GHOSTTY_INIT_SIZED(GhosttySelection);
+    selection.start = start_word.start;
+    selection.end = end_word.end;
+    selection_install(terminal, &selection);
+}
+
+// Select the word under the mouse for a double-click.  Word boundary rules stay
+// in libghostty so Ghostling follows the same behavior as upstream Ghostty.
+static void selection_select_word_at_mouse(GhosttyTerminal terminal,
+                                           int cell_width, int cell_height,
+                                           int pad)
+{
+    GhosttyGridRef ref = GHOSTTY_INIT_SIZED(GhosttyGridRef);
+    if (!terminal_ref_at_mouse(terminal, cell_width, cell_height, pad, &ref))
+        return;
+
+    GhosttyTerminalSelectWordOptions opts =
+        GHOSTTY_INIT_SIZED(GhosttyTerminalSelectWordOptions);
+    opts.ref = ref;
+
+    GhosttySelection selection = GHOSTTY_INIT_SIZED(GhosttySelection);
+    if (ghostty_terminal_select_word(terminal, &opts, &selection) == GHOSTTY_SUCCESS)
+        selection_install(terminal, &selection);
+}
+
+// Select the line under the mouse for a triple-click.  Semantic prompt
+// boundaries are enabled so shell-integration markers can keep prompts and
+// command output from being selected as one unrelated line.
+static void selection_select_line_at_mouse(GhosttyTerminal terminal,
+                                           int cell_width, int cell_height,
+                                           int pad)
+{
+    GhosttyGridRef ref = GHOSTTY_INIT_SIZED(GhosttyGridRef);
+    if (!terminal_ref_at_mouse(terminal, cell_width, cell_height, pad, &ref))
+        return;
+
+    GhosttyTerminalSelectLineOptions opts =
+        GHOSTTY_INIT_SIZED(GhosttyTerminalSelectLineOptions);
+    opts.ref = ref;
+    opts.semantic_prompt_boundary = true;
+
+    GhosttySelection selection = GHOSTTY_INIT_SIZED(GhosttySelection);
+    if (ghostty_terminal_select_line(terminal, &opts, &selection) == GHOSTTY_SUCCESS)
+        selection_install(terminal, &selection);
+}
+
+// Mirror the scrollbar hit region used by handle_scrollbar().  Selection hover
+// and gestures should not claim that strip, otherwise the cursor says "text"
+// while the click actually drags the viewport.
+static bool mouse_over_scrollbar(GhosttyTerminal terminal)
+{
+    GhosttyTerminalScrollbar scrollbar = {0};
+    if (ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_SCROLLBAR,
+                             &scrollbar) != GHOSTTY_SUCCESS)
+        return false;
+    if (scrollbar.total <= scrollbar.len)
+        return false;
+
+    int scr_w = GetScreenWidth();
+    const int bar_width = 6;
+    const int bar_margin = 2;
+    int bar_left = scr_w - bar_width - bar_margin;
+    int hit_left = bar_left - 8;
+    Vector2 mpos = GetMousePosition();
+    return mpos.x >= hit_left && mpos.x <= scr_w;
+}
+
+// Decide whether the mouse is over an area where a selection drag can begin.
+// Blank cells are included because terminal selections can start in empty grid
+// space; the check is about selectable geometry, not text contents.
+static bool mouse_over_selectable_text(GhosttyTerminal terminal,
+                                       int cell_width, int cell_height,
+                                       int pad)
+{
+    if (!mouse_in_terminal_grid(terminal, cell_width, cell_height, pad))
+        return false;
+    if (mouse_over_scrollbar(terminal))
+        return false;
+    if (!selection_allowed_with_mods(terminal, get_ghostty_mods()))
+        return false;
+    return true;
+}
+
+// Update the platform cursor to advertise selection affordance.  This is kept
+// separate from handle_mouse() so the cursor changes on hover even when no
+// mouse button event is being processed.
+static void update_mouse_cursor(GhosttyTerminal terminal,
+                                int cell_width, int cell_height,
+                                int pad,
+                                bool input_enabled,
+                                const SelectionState *selection_state)
+{
+    // Keep the text cursor while an active selection drag is in progress,
+    // even if the pointer leaves the exact selectable cell bounds.
+    bool selecting = selection_state->active && IsMouseButtonDown(MOUSE_BUTTON_LEFT);
+    bool selectable = input_enabled
+        && (selecting || mouse_over_selectable_text(terminal, cell_width, cell_height, pad));
+    SetMouseCursor(selectable ? MOUSE_CURSOR_IBEAM : MOUSE_CURSOR_DEFAULT);
+}
+
 // Encode a mouse event and write the resulting escape sequence to the pty.
 // If the encoder produces no output (e.g. tracking is disabled), this is
 // a no-op.
@@ -322,7 +655,8 @@ static void mouse_encode_and_write(int pty_fd, GhosttyMouseEncoder encoder,
 // based on what the terminal application has requested.
 static void handle_mouse(int pty_fd, GhosttyMouseEncoder encoder,
                          GhosttyMouseEvent event, GhosttyTerminal terminal,
-                         int cell_width, int cell_height, int pad)
+                         int cell_width, int cell_height, int pad,
+                         SelectionState *selection_state)
 {
     // Sync encoder tracking mode and format from terminal state so
     // mode changes (e.g. applications enabling SGR mouse reporting)
@@ -362,6 +696,9 @@ static void handle_mouse(int pty_fd, GhosttyMouseEncoder encoder,
         GHOSTTY_MOUSE_ENCODER_OPT_TRACK_LAST_CELL, &track_cell);
 
     GhosttyMods mods = get_ghostty_mods();
+    bool mouse_tracking = false;
+    ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_MOUSE_TRACKING, &mouse_tracking);
+    bool selection_allowed = selection_allowed_with_mods(terminal, mods);
     Vector2 pos = GetMousePosition();
     ghostty_mouse_event_set_mods(event, mods);
     ghostty_mouse_event_set_position(event,
@@ -380,10 +717,71 @@ static void handle_mouse(int pty_fd, GhosttyMouseEncoder encoder,
             continue;
 
         if (IsMouseButtonPressed(rl_btn)) {
+            if (rl_btn == MOUSE_BUTTON_LEFT && selection_allowed) {
+                double now = GetTime();
+                if (selection_state->click_count > 0) {
+                    double dx = (double)pos.x - selection_state->click_origin_x;
+                    double dy = (double)pos.y - selection_state->click_origin_y;
+                    double max_distance = (double)cell_width;
+                    bool too_late = now - selection_state->last_click_time > 0.5;
+                    bool too_far = dx * dx + dy * dy > max_distance * max_distance;
+                    if (too_late || too_far)
+                        selection_state->click_count = 0;
+                }
+
+                if (selection_state->click_count == 0) {
+                    selection_state->click_origin_x = (double)pos.x;
+                    selection_state->click_origin_y = (double)pos.y;
+                }
+
+                selection_state->click_count++;
+                if (selection_state->click_count > 3) {
+                    selection_state->click_count = 1;
+                    selection_state->click_origin_x = (double)pos.x;
+                    selection_state->click_origin_y = (double)pos.y;
+                }
+                selection_state->last_click_time = now;
+
+                if (!selection_set_anchor_at_mouse(selection_state, terminal,
+                                                   cell_width, cell_height, pad))
+                    continue;
+
+                switch (selection_state->click_count) {
+                case 1:
+                    selection_state->kind = SELECTION_DRAG_CHAR;
+                    selection_clear_terminal(terminal);
+                    break;
+                case 2:
+                    selection_state->kind = SELECTION_DRAG_WORD;
+                    selection_select_word_at_mouse(terminal, cell_width, cell_height, pad);
+                    break;
+                default:
+                    selection_state->kind = SELECTION_DRAG_LINE;
+                    selection_select_line_at_mouse(terminal, cell_width, cell_height, pad);
+                    break;
+                }
+
+                continue;
+            }
+
             ghostty_mouse_event_set_action(event, GHOSTTY_MOUSE_ACTION_PRESS);
             ghostty_mouse_event_set_button(event, gbtn);
             mouse_encode_and_write(pty_fd, encoder, event);
         } else if (IsMouseButtonReleased(rl_btn)) {
+            if (rl_btn == MOUSE_BUTTON_LEFT && selection_state->active) {
+                if (selection_state->moved) {
+                    if (selection_state->kind == SELECTION_DRAG_CHAR) {
+                        selection_update_char_drag(selection_state, terminal,
+                                                   cell_width, cell_height, pad, mods);
+                    } else if (selection_state->kind == SELECTION_DRAG_WORD) {
+                        selection_update_word_drag(selection_state, terminal,
+                                                   cell_width, cell_height, pad);
+                    }
+                }
+                selection_state_clear_anchor(selection_state);
+                continue;
+            }
+
             ghostty_mouse_event_set_action(event, GHOSTTY_MOUSE_ACTION_RELEASE);
             ghostty_mouse_event_set_button(event, gbtn);
             mouse_encode_and_write(pty_fd, encoder, event);
@@ -394,6 +792,18 @@ static void handle_mouse(int pty_fd, GhosttyMouseEncoder encoder,
     // (or no button for pure motion in any-event tracking mode).
     Vector2 delta = GetMouseDelta();
     if (delta.x != 0.0f || delta.y != 0.0f) {
+        if (selection_state->active && IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
+            selection_state->moved = true;
+            if (selection_state->kind == SELECTION_DRAG_CHAR) {
+                selection_update_char_drag(selection_state, terminal,
+                                           cell_width, cell_height, pad, mods);
+            } else if (selection_state->kind == SELECTION_DRAG_WORD) {
+                selection_update_word_drag(selection_state, terminal,
+                                           cell_width, cell_height, pad);
+            }
+            return;
+        }
+
         ghostty_mouse_event_set_action(event, GHOSTTY_MOUSE_ACTION_MOTION);
         if (IsMouseButtonDown(MOUSE_BUTTON_LEFT))
             ghostty_mouse_event_set_button(event, GHOSTTY_MOUSE_BUTTON_LEFT);
@@ -412,11 +822,6 @@ static void handle_mouse(int pty_fd, GhosttyMouseEncoder encoder,
     // the scrollback buffer so the user can review history.
     float wheel = GetMouseWheelMove();
     if (wheel != 0.0f) {
-        // Check whether any mouse tracking mode is enabled.  If so,
-        // the application wants to handle scroll events itself.
-        bool mouse_tracking = false;
-        ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_MOUSE_TRACKING, &mouse_tracking);
-
         if (mouse_tracking) {
             // Forward to the application via the mouse encoder.
             GhosttyMouseButton scroll_btn = (wheel > 0.0f)
@@ -843,6 +1248,14 @@ static void render_terminal(GhosttyRenderState render_state,
         int x = pad;
 
         while (ghostty_render_state_row_cells_next(cells)) {
+            // Selection membership is computed by libghostty from the
+            // terminal-owned selection.  Ghostling only chooses the visual
+            // policy: selected cells use reverse-video colors, matching the
+            // common terminal behavior and avoiding a separate theme knob.
+            bool selected = false;
+            ghostty_render_state_row_cells_get(cells,
+                GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_SELECTED, &selected);
+
             // How many codepoints make up the grapheme? 0 = empty cell.
             uint32_t grapheme_len = 0;
             ghostty_render_state_row_cells_get(cells,
@@ -855,7 +1268,11 @@ static void render_terminal(GhosttyRenderState render_state,
                 // and palette indices for us, returning INVALID_VALUE
                 // when the cell has no background.
                 GhosttyColorRgb bg = {0};
-                if (ghostty_render_state_row_cells_get(cells,
+                if (selected) {
+                    bg = colors.foreground;
+                    DrawRectangle(x, y, cell_width, cell_height,
+                                  (Color){ bg.r, bg.g, bg.b, 255 });
+                } else if (ghostty_render_state_row_cells_get(cells,
                         GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_BG_COLOR, &bg) == GHOSTTY_SUCCESS) {
                     DrawRectangle(x, y, cell_width, cell_height,
                                   (Color){ bg.r, bg.g, bg.b, 255 });
@@ -905,6 +1322,13 @@ static void render_terminal(GhosttyRenderState render_state,
             if (style.inverse) {
                 GhosttyColorRgb tmp = fg;
                 fg = bg_rgb;
+                bg_rgb = tmp;
+                has_bg = true;
+            }
+
+            if (selected) {
+                GhosttyColorRgb tmp = fg;
+                fg = has_bg ? bg_rgb : colors.background;
                 bg_rgb = tmp;
                 has_bg = true;
             }
@@ -1264,6 +1688,7 @@ int main(void)
     GhosttyRenderStateRowIterator row_iter = NULL;
     GhosttyRenderStateRowCells row_cells = NULL;
     GhosttyKittyGraphicsPlacementIterator placement_iter = NULL;
+    SelectionState selection_state = {0};
     int exit_code = 0;
 
     // Install the PNG decoder via the sys interface so the terminal can
@@ -1531,12 +1956,15 @@ int main(void)
         bool scrollbar_consumed = handle_scrollbar(terminal, render_state,
                                                    &scrollbar_dragging);
 
+        update_mouse_cursor(terminal, cell_width, cell_height, pad,
+                            !child_exited, &selection_state);
+
         // Forward keyboard/mouse input only while the child is alive.
         if (!child_exited) {
             handle_input(pty_fd, key_encoder, key_event, terminal);
             if (!scrollbar_consumed)
                 handle_mouse(pty_fd, mouse_encoder, mouse_event, terminal,
-                             cell_width, cell_height, pad);
+                             cell_width, cell_height, pad, &selection_state);
         }
 
         // Snapshot the terminal state into our render state.  This is the
@@ -1594,6 +2022,7 @@ int main(void)
     }
 
 cleanup:
+    selection_state_clear_anchor(&selection_state);
     UnloadFont(mono_font);
     CloseWindow();
     if (pty_fd >= 0)
