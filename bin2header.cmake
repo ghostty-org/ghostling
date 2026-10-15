@@ -4,31 +4,18 @@
 #   cmake -DINPUT=<file> -DOUTPUT=<file> -DARRAY_NAME=<name> -P bin2header.cmake
 
 file(READ "${INPUT}" hex HEX)
-string(LENGTH "${hex}" hex_len)
 
-set(output "// Auto-generated from ${INPUT} — do not edit.\n")
-string(APPEND output "static const unsigned char ${ARRAY_NAME}[] = {\n    ")
+# Convert each byte pair to "0xNN," in one regex pass. A per-byte
+# loop is O(n^2) in CMake because every iteration re-expands the
+# whole hex string, which made the build appear to hang on the font.
+string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," bytes "${hex}")
 
-math(EXPR last_byte "${hex_len} / 2 - 1")
-set(col 0)
-set(i 0)
-while(i LESS hex_len)
-  math(EXPR next "${i} + 2")
-  string(SUBSTRING "${hex}" ${i} 2 byte)
-  math(EXPR byte_idx "${i} / 2")
-  if(byte_idx LESS last_byte)
-    string(APPEND output "0x${byte}, ")
-  else()
-    string(APPEND output "0x${byte}")
-  endif()
-  math(EXPR col "${col} + 1")
-  if(col EQUAL 12)
-    string(APPEND output "\n    ")
-    set(col 0)
-  endif()
-  set(i ${next})
-endwhile()
+# Wrap every 12 bytes. CMake's regex has no {n} quantifier, so the
+# 12-byte pattern is built with string(REPEAT). The trailing comma
+# after the last byte is valid C, so no special case is needed.
+string(REPEAT "0x[0-9a-f][0-9a-f]," 12 row)
+string(REGEX REPLACE "(${row})" "\\1\n    " bytes "${bytes}")
 
-string(APPEND output "\n};\n")
-
-file(WRITE "${OUTPUT}" "${output}")
+file(WRITE "${OUTPUT}"
+  "// Auto-generated from ${INPUT} — do not edit.\n"
+  "static const unsigned char ${ARRAY_NAME}[] = {\n    ${bytes}\n};\n")
