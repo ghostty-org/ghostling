@@ -1345,11 +1345,24 @@ int main(void)
 
     // Allow images to be transmitted via file, temp file, and shared
     // memory mediums in addition to the default inline (direct) medium.
+    // The file and shared-memory options take a bool*.
     bool medium_enabled = true;
     ghostty_terminal_set(terminal, GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_MEDIUM_FILE,
         &medium_enabled);
+
+    // The temp-file option is different: it takes a GhosttyString* naming
+    // the directory temp files may be read from (NULL disables the medium).
+    // Passing the bool* here was a type mismatch: the library cast a 1-byte
+    // object to GhosttyString*, which panics on the alignment check in
+    // Debug builds and is undefined behavior in Release builds.
+    // The string is copied into the terminal, so a literal is fine.
+    // sizeof - 1 avoids a string.h dependency and excludes the NUL.
+    GhosttyString kitty_temp_dir = {
+        .ptr = (const uint8_t*)"/tmp",
+        .len = sizeof("/tmp") - 1,
+    };
     ghostty_terminal_set(terminal, GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_MEDIUM_TEMP_FILE,
-        &medium_enabled);
+        &kitty_temp_dir);
     ghostty_terminal_set(terminal, GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_MEDIUM_SHARED_MEM,
         &medium_enabled);
 
