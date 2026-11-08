@@ -1348,10 +1348,21 @@ int main(void)
     bool medium_enabled = true;
     ghostty_terminal_set(terminal, GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_MEDIUM_FILE,
         &medium_enabled);
-    ghostty_terminal_set(terminal, GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_MEDIUM_TEMP_FILE,
-        &medium_enabled);
     ghostty_terminal_set(terminal, GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_MEDIUM_SHARED_MEM,
         &medium_enabled);
+
+    // The temp file medium takes the allowed directory (GhosttyString*), not
+    // a bool*.  Use $TMPDIR since on macOS it is not /tmp.  The string is
+    // copied, so getenv()'s storage only needs to outlive the call.
+    const char *tmp_dir = getenv("TMPDIR");
+    if (tmp_dir == NULL || tmp_dir[0] == '\0')
+        tmp_dir = "/tmp";
+    GhosttyString tmp_dir_str = {
+        .ptr = (const uint8_t *)tmp_dir,
+        .len = strlen(tmp_dir),
+    };
+    ghostty_terminal_set(terminal, GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_MEDIUM_TEMP_FILE,
+        &tmp_dir_str);
 
     // Create the key encoder and a reusable key event for input handling.
     // The encoder translates key events into the correct VT escape
