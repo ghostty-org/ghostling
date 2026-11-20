@@ -100,12 +100,16 @@ static int pty_spawn(pid_t *child_out, uint16_t cols, uint16_t rows,
 // retry on EINTR, advance past partial writes, and silently drop
 // data if the kernel buffer is full (EAGAIN) — this matches what
 // most terminal emulators do under back-pressure.
-static void pty_write(int pty_fd, const char *buf, size_t len)
+// Takes `const void *` so callers can pass either byte or char buffers
+// (libghostty's encoders emit uint8_t, raylib hands us char) without
+// tripping -Wpointer-sign.
+static void pty_write(int pty_fd, const void *buf, size_t len)
 {
+    const uint8_t *p = (const uint8_t *)buf;
     while (len > 0) {
-        ssize_t n = write(pty_fd, buf, len);
+        ssize_t n = write(pty_fd, p, len);
         if (n > 0) {
-            buf += n;
+            p += n;
             len -= (size_t)n;
         } else if (n < 0) {
             if (errno == EINTR)
@@ -307,7 +311,7 @@ static GhosttyMouseButton raylib_mouse_to_ghostty(int rl_button)
 static void mouse_encode_and_write(int pty_fd, GhosttyMouseEncoder encoder,
                                    GhosttyMouseEvent event)
 {
-    char buf[128];
+    uint8_t buf[128];
     size_t written = 0;
     GhosttyResult res = ghostty_mouse_encoder_encode(
         encoder, event, buf, sizeof(buf), &written);
@@ -327,7 +331,7 @@ static void handle_mouse(int pty_fd, GhosttyMouseEncoder encoder,
     // Sync encoder tracking mode and format from terminal state so
     // mode changes (e.g. applications enabling SGR mouse reporting)
     // are honoured automatically.
-    ghostty_mouse_encoder_setopt_from_terminal(encoder, terminal);
+    ghostty_mouse_encoder_set_from_terminal(encoder, terminal);
 
     // Provide the encoder with the current terminal geometry so it
     // can convert pixel positions to cell coordinates.
@@ -344,7 +348,7 @@ static void handle_mouse(int pty_fd, GhosttyMouseEncoder encoder,
         .padding_left  = (uint32_t)pad,
         .padding_right = (uint32_t)pad,
     };
-    ghostty_mouse_encoder_setopt(encoder,
+    ghostty_mouse_encoder_set(encoder,
         GHOSTTY_MOUSE_ENCODER_OPT_SIZE, &enc_size);
 
     // Track whether any button is currently held — the encoder uses
@@ -352,13 +356,13 @@ static void handle_mouse(int pty_fd, GhosttyMouseEncoder encoder,
     bool any_pressed = IsMouseButtonDown(MOUSE_BUTTON_LEFT)
                     || IsMouseButtonDown(MOUSE_BUTTON_RIGHT)
                     || IsMouseButtonDown(MOUSE_BUTTON_MIDDLE);
-    ghostty_mouse_encoder_setopt(encoder,
+    ghostty_mouse_encoder_set(encoder,
         GHOSTTY_MOUSE_ENCODER_OPT_ANY_BUTTON_PRESSED, &any_pressed);
 
     // Enable motion deduplication so the encoder suppresses redundant
     // motion events within the same cell.
     bool track_cell = true;
-    ghostty_mouse_encoder_setopt(encoder,
+    ghostty_mouse_encoder_set(encoder,
         GHOSTTY_MOUSE_ENCODER_OPT_TRACK_LAST_CELL, &track_cell);
 
     GhosttyMods mods = get_ghostty_mods();
@@ -433,7 +437,7 @@ static void handle_mouse(int pty_fd, GhosttyMouseEncoder encoder,
             // to scroll up (into history), positive to scroll down.
             int delta = (wheel > 0.0f) ? -3 : 3;
             GhosttyTerminalScrollViewport sv = {
-                .tag = GHOSTTY_SCROLL_VIEWPORT_DELTA,
+                .tag = GHOSTTY_TERMINAL_SCROLL_VIEWPORT_DELTA,
                 .value = { .delta = delta },
             };
             ghostty_terminal_scroll_viewport(terminal, sv);
@@ -451,7 +455,7 @@ static void handle_input(int pty_fd, GhosttyKeyEncoder encoder,
 {
     // Sync encoder options from the terminal so mode changes (e.g.
     // application cursor keys, Kitty keyboard protocol) are honoured.
-    ghostty_key_encoder_setopt_from_terminal(encoder, terminal);
+    ghostty_key_encoder_set_from_terminal(encoder, terminal);
 
     // Drain printable characters from raylib's input queue.  We collect
     // them into a single UTF-8 buffer so the encoder can attach text
@@ -534,15 +538,19 @@ static void handle_input(int pty_fd, GhosttyKeyEncoder encoder,
         // for special keys or ctrl combos there's typically no text.
         // Release events never carry text.
         if (char_utf8_len > 0 && !released) {
-            ghostty_key_event_set_utf8(event, char_utf8, (size_t)char_utf8_len);
+            GhosttyString utf8 = {
+              .ptr = (const uint8_t *)char_utf8,
+              .len = char_utf8_len,
+            };
+            ghostty_key_event_set_utf8(event, utf8);
             // Only attach the text to the first key event this frame
             // to avoid duplicating it.
             char_utf8_len = 0;
         } else {
-            ghostty_key_event_set_utf8(event, NULL, 0);
+            ghostty_key_event_set_utf8(event, (GhosttyString){0});
         }
 
-        char buf[128];
+        uint8_t buf[128];
         size_t written = 0;
         GhosttyResult res = ghostty_key_encoder_encode(
             encoder, event, buf, sizeof(buf), &written);
@@ -613,7 +621,7 @@ static bool handle_scrollbar(GhosttyTerminal terminal,
         intptr_t delta = (intptr_t)(target - (int64_t)scrollbar.offset);
         if (delta != 0) {
             GhosttyTerminalScrollViewport sv = {
-                .tag = GHOSTTY_SCROLL_VIEWPORT_DELTA,
+                .tag = GHOSTTY_TERMINAL_SCROLL_VIEWPORT_DELTA,
                 .value = { .delta = delta },
             };
             ghostty_terminal_scroll_viewport(terminal, sv);
@@ -663,12 +671,12 @@ static void render_kitty_images(GhosttyTerminal terminal,
                                 GhosttyKittyGraphics graphics,
                                 GhosttyKittyGraphicsPlacementIterator placement_iter,
                                 int cell_width, int cell_height, int pad,
-                                GhosttyKittyPlacementLayer layer)
+                                uint32_t layer_mask)
 {
     // Configure the layer filter on the iterator so
     // placement_next() only yields matching placements.
     ghostty_kitty_graphics_placement_iterator_set(placement_iter,
-        GHOSTTY_KITTY_GRAPHICS_PLACEMENT_ITERATOR_OPTION_LAYER, &layer);
+        GHOSTTY_KITTY_GRAPHICS_PLACEMENT_ITERATOR_OPT_LAYER, &layer_mask);
 
     // Re-populate the iterator for this layer scan.
     if (ghostty_kitty_graphics_get(graphics,
@@ -700,24 +708,24 @@ static void render_kitty_images(GhosttyTerminal terminal,
         // (the PNG decoder we registered converts everything to RGBA).
         uint32_t img_w = 0, img_h = 0;
         ghostty_kitty_graphics_image_get(image_handle,
-            GHOSTTY_KITTY_IMAGE_DATA_WIDTH, &img_w);
+            GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_WIDTH, &img_w);
         ghostty_kitty_graphics_image_get(image_handle,
-            GHOSTTY_KITTY_IMAGE_DATA_HEIGHT, &img_h);
+            GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_HEIGHT, &img_h);
         if (img_w == 0 || img_h == 0)
             continue;
 
         GhosttyKittyImageFormat fmt = GHOSTTY_KITTY_IMAGE_FORMAT_RGBA;
         ghostty_kitty_graphics_image_get(image_handle,
-            GHOSTTY_KITTY_IMAGE_DATA_FORMAT, &fmt);
+            GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_FORMAT, &fmt);
         if (fmt != GHOSTTY_KITTY_IMAGE_FORMAT_RGBA)
             continue;
 
         const uint8_t *data_ptr = NULL;
         size_t data_len = 0;
         ghostty_kitty_graphics_image_get(image_handle,
-            GHOSTTY_KITTY_IMAGE_DATA_DATA_PTR, &data_ptr);
+            GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_PIXELS, &data_ptr);
         ghostty_kitty_graphics_image_get(image_handle,
-            GHOSTTY_KITTY_IMAGE_DATA_DATA_LEN, &data_len);
+            GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_EXPECTED_LEN, &data_len);
         if (!data_ptr || data_len < (size_t)img_w * img_h * 4)
             continue;
 
@@ -809,7 +817,7 @@ static void render_terminal(GhosttyRenderState render_state,
     // Grab colors (palette, default fg/bg) from the render state so we
     // can resolve palette-indexed cell colors.
     GhosttyRenderStateColors colors = GHOSTTY_INIT_SIZED(GhosttyRenderStateColors);
-    if (ghostty_render_state_colors_get(render_state, &colors) != GHOSTTY_SUCCESS)
+    if (ghostty_render_state_get(render_state, GHOSTTY_RENDER_STATE_DATA_COLORS, &colors) != GHOSTTY_SUCCESS)
         return;
 
     // Obtain the Kitty graphics storage from the terminal.  This is a
@@ -828,7 +836,7 @@ static void render_terminal(GhosttyRenderState render_state,
     if (has_kitty && placement_iter) {
         render_kitty_images(terminal, kitty_gfx, placement_iter,
                             cell_width, cell_height, pad,
-                            GHOSTTY_KITTY_PLACEMENT_LAYER_BELOW_BG);
+                            GHOSTTY_IMAGE_LAYER_MASK_BELOW_BACKGROUND);
     }
 
     // Small padding from the window edges.
@@ -868,8 +876,12 @@ static void render_terminal(GhosttyRenderState render_state,
             // Read the grapheme codepoints.
             uint32_t codepoints[16];
             uint32_t len = grapheme_len < 16 ? grapheme_len : 16;
+            GhosttyCodepointBuffer graphemes = {
+              .ptr = codepoints,
+              .cap = sizeof(codepoints) / sizeof(codepoints[0]),
+            };
             ghostty_render_state_row_cells_get(cells,
-                GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_BUF, codepoints);
+                GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_BUF, &graphemes);
 
             // Build a UTF-8 string from the grapheme codepoints.
             char text[64];
@@ -897,12 +909,12 @@ static void render_terminal(GhosttyRenderState render_state,
 
             // Read the style for flags (inverse, bold, italic) — color
             // resolution is handled above via the new API.
-            GhosttyStyle style = GHOSTTY_INIT_SIZED(GhosttyStyle);
+            GhosttyStyle style = {0};
             ghostty_render_state_row_cells_get(cells,
                 GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_STYLE, &style);
 
             // Inverse (reverse video): swap foreground and background colors.
-            if (style.inverse) {
+            if (style.flags & GHOSTTY_STYLE_FLAG_INVERSE) {
                 GhosttyColorRgb tmp = fg;
                 fg = bg_rgb;
                 bg_rgb = tmp;
@@ -920,13 +932,14 @@ static void render_terminal(GhosttyRenderState render_state,
             // Italic: apply a simple shear by shifting the top of the glyph
             // to the right.  The offset is proportional to font size so it
             // looks reasonable at any scale.
-            int italic_offset = style.italic ? (font_size / 6) : 0;
+            int italic_offset =
+                (style.flags & GHOSTTY_STYLE_FLAG_ITALIC) ? (font_size / 6) : 0;
 
             DrawTextEx(font, text, (Vector2){x + italic_offset, y}, font_size, 0, ray_fg);
 
             // Bold: draw the text a second time shifted 1 pixel to the
             // right to thicken the strokes ("fake bold").
-            if (style.bold) {
+            if (style.flags & GHOSTTY_STYLE_FLAG_BOLD) {
                 DrawTextEx(font, text, (Vector2){x + italic_offset + 1, y}, font_size, 0, ray_fg);
             }
 
@@ -936,7 +949,7 @@ static void render_terminal(GhosttyRenderState render_state,
         // Clear per-row dirty flag after rendering it.
         bool clean = false;
         ghostty_render_state_row_set(row_iter,
-            GHOSTTY_RENDER_STATE_ROW_OPTION_DIRTY, &clean);
+            GHOSTTY_RENDER_STATE_ROW_OPT_DIRTY, &clean);
 
         y += cell_height;
     }
@@ -949,7 +962,7 @@ static void render_terminal(GhosttyRenderState render_state,
     if (has_kitty && placement_iter) {
         render_kitty_images(terminal, kitty_gfx, placement_iter,
                             cell_width, cell_height, pad,
-                            GHOSTTY_KITTY_PLACEMENT_LAYER_BELOW_TEXT);
+                            GHOSTTY_IMAGE_LAYER_MASK_BELOW_TEXT);
     }
 
     // Draw the cursor.
@@ -981,7 +994,7 @@ static void render_terminal(GhosttyRenderState render_state,
     if (has_kitty && placement_iter) {
         render_kitty_images(terminal, kitty_gfx, placement_iter,
                             cell_width, cell_height, pad,
-                            GHOSTTY_KITTY_PLACEMENT_LAYER_ABOVE_TEXT);
+                            GHOSTTY_IMAGE_LAYER_MASK_ABOVE_TEXT);
     }
 
     // Draw the scrollbar when there is scrollback content to scroll through.
@@ -1014,7 +1027,7 @@ static void render_terminal(GhosttyRenderState render_state,
     // Reset global dirty state so the next update reports changes accurately.
     GhosttyRenderStateDirty clean_state = GHOSTTY_RENDER_STATE_DIRTY_FALSE;
     ghostty_render_state_set(render_state,
-        GHOSTTY_RENDER_STATE_OPTION_DIRTY, &clean_state);
+        GHOSTTY_RENDER_STATE_OPT_DIRTY, &clean_state);
 }
 
 // ---------------------------------------------------------------------------
@@ -1106,7 +1119,7 @@ static void effect_write_pty(GhosttyTerminal terminal, void *userdata,
 {
     (void)terminal;
     EffectsContext *ctx = (EffectsContext *)userdata;
-    pty_write(ctx->pty_fd, (const char *)data, len);
+    pty_write(ctx->pty_fd, data, len);
 }
 
 // size effect — responds to XTWINOPS size queries (CSI 14/16/18 t)
@@ -1343,12 +1356,10 @@ int main(void)
     ghostty_terminal_set(terminal, GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_STORAGE_LIMIT,
         &kitty_storage_limit);
 
-    // Allow images to be transmitted via file, temp file, and shared
+    // Allow images to be transmitted via file and shared
     // memory mediums in addition to the default inline (direct) medium.
     bool medium_enabled = true;
     ghostty_terminal_set(terminal, GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_MEDIUM_FILE,
-        &medium_enabled);
-    ghostty_terminal_set(terminal, GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_MEDIUM_TEMP_FILE,
         &medium_enabled);
     ghostty_terminal_set(terminal, GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_MEDIUM_SHARED_MEM,
         &medium_enabled);
@@ -1489,7 +1500,7 @@ int main(void)
                 && focus_mode.value) {
                 GhosttyFocusEvent focus_event = focused
                     ? GHOSTTY_FOCUS_GAINED : GHOSTTY_FOCUS_LOST;
-                char focus_buf[8];
+                uint8_t focus_buf[8];
                 size_t focus_written = 0;
                 GhosttyResult focus_res = ghostty_focus_encode(
                     focus_event, focus_buf, sizeof(focus_buf), &focus_written);
@@ -1546,8 +1557,12 @@ int main(void)
 
         // Get the terminal's background color from the render state.
         GhosttyRenderStateColors bg_colors = GHOSTTY_INIT_SIZED(GhosttyRenderStateColors);
-        ghostty_render_state_colors_get(render_state, &bg_colors);
-        Color win_bg = { bg_colors.background.r, bg_colors.background.g, bg_colors.background.b, 255 };
+        Color win_bg = { 0, 0, 0, 255 };
+        if (ghostty_render_state_get(render_state, GHOSTTY_RENDER_STATE_DATA_COLORS,
+                                    &bg_colors) == GHOSTTY_SUCCESS) {
+            win_bg = (Color){ bg_colors.background.r, bg_colors.background.g,
+                              bg_colors.background.b, 255 };
+        }
 
         // Query scrollbar state for the renderer.
         GhosttyTerminalScrollbar scrollbar = {0};
