@@ -36,8 +36,8 @@ endif()
 # shared library. See https://ghostty.org/docs/install/build for the
 # required Zig version.
 FetchContent_Declare(ghostty
-  GIT_REPOSITORY https://github.com/ghostty-org/ghostty.git
-  GIT_TAG f64f4aca2c29b554d111b36c3d946a9bddd159ff
+  URL https://release.files.ghostty.org/libghostty-vt/1.0.1/libghostty-vt-1.0.1.tar.gz
+  URL_HASH SHA256=333dfce97641ef9b536bb9e08907ad86abaaada50e8f7417b70d9284adef37aa
 )
 FetchContent_MakeAvailable(ghostty)
 
