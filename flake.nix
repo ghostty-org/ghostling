@@ -21,8 +21,8 @@
         pkgs = nixpkgs.legacyPackages.${system};
         zigPackage =
           if pkgs.stdenv.hostPlatform.isDarwin
-          then zig.packages.${system}.brew."0.16.0"
-          else zig.packages.${system}."0.16.0";
+          then zig.packages.${system}.brew."0.17.0"
+          else zig.packages.${system}."0.17.0";
       in {
         devShells.default = pkgs.mkShell {
           packages = [
