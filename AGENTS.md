@@ -2,7 +2,7 @@
 
 ## Building
 
-- Requires CMake 3.19+, Ninja, a C compiler, and Zig 0.16.x on PATH
+- Requires CMake 3.19+, Ninja, a C compiler, and Zig 0.17.x on PATH
 - Configure: `cmake -B build -G Ninja`
 - Build: `cmake --build build`
 - Release build: `cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release`
